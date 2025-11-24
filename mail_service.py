@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import base64
 import os
@@ -39,6 +39,20 @@ def _extract_header(headers: List[Dict[str, str]], name: str) -> str:
         if header.get("name", "").lower() == name.lower():
             return header.get("value", "")
     return ""
+
+
+def _parse_authentication_results(headers: List[Dict[str, str]]) -> Dict[str, bool]:
+    """Extract coarse SPF/DKIM/DMARC pass signals from Authentication-Results header."""
+
+    auth_header = _extract_header(headers, "Authentication-Results").lower()
+    if not auth_header:
+        return {"spf_pass": False, "dkim_pass": False, "dmarc_pass": False}
+
+    return {
+        "spf_pass": "spf=pass" in auth_header,
+        "dkim_pass": "dkim=pass" in auth_header,
+        "dmarc_pass": "dmarc=pass" in auth_header,
+    }
 
 
 def _decode_body(part: Dict[str, Any]) -> str:
@@ -112,12 +126,17 @@ def get_unread_emails(max_results: int = 10) -> List[Dict[str, Any]]:
         if payload:
             _walk_parts(payload, body_segments, attachments)
 
+        auth_signals = _parse_authentication_results(headers)
+        label_ids = message.get("labelIds", []) or []
+
         emails.append(
             {
                 "id": msg_id,
                 "subject": subject,
                 "body": "\n".join(body_segments).strip(),
                 "attachments": attachments,
+                "gmail_labels": label_ids,
+                "auth_results": auth_signals,
             }
         )
 

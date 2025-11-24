@@ -17,9 +17,16 @@ import torch.nn.functional as F
 from flask import Flask, jsonify, request, abort
 from openai import OpenAI
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from gmail_client import fetch_message_detail
 from mail_service import GmailAuthError, get_unread_emails
+from server.gmail_client import (
+    GmailClientError,
+    fetch_message_detail,
+    fetch_recent_messages,
+)
 
 from prompt_version_tracker import PromptVersionTracker, PromptRun
+from phishing_analysis import PhishingAnalysisStore, analyze_email_content
 
 try:
     from optimized_pipeline import classify_batch as fast_classify_batch, feedback_async as fast_feedback_async
@@ -49,6 +56,7 @@ tracker.register_prompt("v1", "Explain risk + 3 steps.")
 
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
+analysis_store = PhishingAnalysisStore()
 
 
 def json_abort(status: int, message: str):
@@ -354,6 +362,89 @@ def fetch_and_analyze():
         )
 
     return jsonify({"results": results, "remaining_free_calls": remaining}), 200
+
+
+<<<<<<< ours
+@app.post("/api/emails/<message_id>/analyze")
+def analyze_gmail_email(message_id: str):
+    token = request.headers.get("X-API-Key")
+    _, remaining = verify_and_meter(token)
+
+    try:
+        email = fetch_message_detail(message_id)
+    except GmailAuthError as exc:
+        logger.warning("Gmail auth error for %s: %s", message_id, exc)
+        return jsonify({"error": str(exc)}), 400
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        logger.error("Failed to fetch Gmail message %s: %s", message_id, exc)
+        return jsonify({"error": "gmail_fetch_failed"}), 502
+
+    try:
+        analysis = analyze_email_content(
+            subject=email.get("subject") or "",
+            sender=email.get("sender") or "",
+            body=email.get("body") or "",
+            client=client,
+            model=OPENAI_MODEL,
+        )
+    except Exception as exc:  # pragma: no cover - defensive against OpenAI errors
+        logger.error("Analysis failed for %s: %s", message_id, exc)
+        return jsonify({"error": "analysis_failed"}), 502
+
+    response_body = {
+        "messageId": message_id,
+        "isPhishing": bool(analysis.get("is_phishing")),
+        "riskScore": int(analysis.get("risk_score", 0)),
+        "reasons": analysis.get("reasons", []),
+        "summary": analysis.get("summary", ""),
+        "remaining_free_calls": remaining,
+    }
+
+    analysis_store.save(response_body)
+    return jsonify(response_body), 200
+=======
+@app.get("/api/emails")
+def list_emails():
+    try:
+        limit = int(request.args.get("limit", 20))
+    except (TypeError, ValueError):
+        return jsonify({"error": "limit must be an integer"}), 400
+
+    limit = max(1, min(limit, 100))
+
+    try:
+        messages = fetch_recent_messages(limit=limit)
+    except GmailAuthError as exc:
+        logger.error("Gmail configuration error: %s", exc)
+        return jsonify({"error": "gmail_configuration", "detail": str(exc)}), 500
+    except GmailClientError as exc:
+        logger.error("Gmail API error while listing emails: %s", exc)
+        return jsonify({"error": str(exc)}), getattr(exc, "status_code", 502)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected failure listing emails: %s", exc)
+        return jsonify({"error": "internal_error"}), 500
+
+    return jsonify(messages), 200
+
+
+@app.get("/api/emails/<message_id>")
+def get_email_detail(message_id: str):
+    try:
+        detail = fetch_message_detail(message_id)
+    except GmailAuthError as exc:
+        logger.error("Gmail configuration error: %s", exc)
+        return jsonify({"error": "gmail_configuration", "detail": str(exc)}), 500
+    except GmailClientError as exc:
+        logger.error("Gmail API error while fetching message %s: %s", message_id, exc)
+        return jsonify({"error": str(exc)}), getattr(exc, "status_code", 502)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected failure fetching email %s: %s", message_id, exc)
+        return jsonify({"error": "internal_error"}), 500
+
+    return jsonify(detail), 200
+>>>>>>> theirs
 
 
 @app.get("/metrics/summary")
