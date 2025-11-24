@@ -56,14 +56,19 @@ def analyze_in_threads(texts: Sequence[str], batch_size: int = 64) -> Sequence[D
     return flattened
 
 
-async def feedback_async(items: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+async def feedback_async(
+    items: Sequence[Dict[str, Any]], detection_policy: str = ""
+) -> Sequence[Dict[str, Any]]:
     async def _one(item: Dict[str, Any]):
-        prompt = f"""Email:
+        prompt = f"""Detection policy:
+{detection_policy or 'Use best-practice phishing detection criteria (payload, sender, urgency, links).'}
+
+Email:
 {item['text']}
 
 Verdict: {item['label']} ({item['confidence']:.2%})
 
-Explain briefly why/why not it is risky and give three safe actions."""
+Explain briefly why/why not it is risky, cite the policy items you used, and give three safe actions."""
         started = time.perf_counter()
         resp = await async_client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -86,7 +91,14 @@ Explain briefly why/why not it is risky and give three safe actions."""
 
 def analyze_emails(texts: Sequence[str]) -> Sequence[Dict[str, Any]]:
     batches = analyze_in_threads(texts)
-    feedback = asyncio.run(feedback_async(batches))
+    detection_policy = os.getenv(
+        "PHISHING_POLICY",
+        (
+            "Follow Gmail spam indicators, SPF/DKIM/DMARC failures, suspicious links, "
+            "unexpected attachments, sender mismatch, and urgent/social-engineering language."
+        ),
+    )
+    feedback = asyncio.run(feedback_async(batches, detection_policy=detection_policy))
     for record, fb in zip(batches, feedback):
         record["feedback"] = fb["content"]
         record["latency_ms"] = fb["latency_ms"]
