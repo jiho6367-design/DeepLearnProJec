@@ -132,4 +132,24 @@ if st.session_state["fetch_results"]:
     result_df = pd.DataFrame(st.session_state["fetch_results"])
     if not result_df.empty:
         result_df = result_df.sort_values(by="confidence", ascending=False)
-        st.dataframe(result_df, width="stretch")
+        # build summary view for dashboard
+        def format_gmail_labels(labels):
+            if isinstance(labels, list):
+                return ", ".join(labels)
+            return labels or ""
+
+        def get_column(df: pd.DataFrame, name: str, default):
+            return df[name] if name in df else pd.Series([default] * len(df))
+
+        summary_base = result_df.copy()
+        summary_base["confidence_pct"] = (get_column(summary_base, "confidence", 0).fillna(0) * 100).round(2)
+        summary_base["gmail_labels"] = get_column(summary_base, "gmail_labels", "").apply(format_gmail_labels)
+        df_summary = summary_base.reindex(
+            columns=["subject", "label", "confidence_pct", "attachments", "gmail_labels", "latency_ms"]
+        )
+
+        st.subheader("Email Analysis (Summary View)")
+        st.dataframe(df_summary, use_container_width=True)
+
+        if st.checkbox("Show raw analysis data"):
+            st.dataframe(result_df, use_container_width=True)
