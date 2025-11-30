@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from google.auth.exceptions import RefreshError
@@ -88,6 +89,19 @@ def _extract_header(headers: List[Dict[str, str]], name: str) -> str:
     return ""
 
 
+def _parse_authentication_results(headers: List[Dict[str, str]]) -> Dict[str, bool]:
+    """Extract coarse SPF/DKIM/DMARC pass signals from Authentication-Results header."""
+    auth_header = _extract_header(headers, "Authentication-Results").lower()
+    if not auth_header:
+        return {"spf_pass": False, "dkim_pass": False, "dmarc_pass": False}
+
+    return {
+        "spf_pass": "spf=pass" in auth_header,
+        "dkim_pass": "dkim=pass" in auth_header,
+        "dmarc_pass": "dmarc=pass" in auth_header,
+    }
+
+
 def _collect_text_parts(part: Dict[str, Any], accumulator: List[str]) -> None:
     mime_type = part.get("mimeType", "")
     body_data = part.get("body", {}) or {}
@@ -101,18 +115,15 @@ def _collect_text_parts(part: Dict[str, Any], accumulator: List[str]) -> None:
         _collect_text_parts(child, accumulator)
 
 
-def fetch_recent_messages(limit: int = 20) -> List[Dict[str, Any]]:
+def fetch_recent_messages(limit: int = 20, label: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return a list of recent messages with basic metadata."""
     limit = max(1, min(int(limit or 20), 100))
     service = get_gmail_service()
     try:
-        response = (
-            service.users()
-            .messages()
-            .list(userId="me", maxResults=limit)
-            .execute()
-            or {}
-        )
+        list_call = service.users().messages().list(userId="me", maxResults=limit)
+        if label:
+            list_call = service.users().messages().list(userId="me", maxResults=limit, labelIds=[label])
+        response = list_call.execute() or {}
     except HttpError as exc:
         logger.error("Gmail list messages failed: %s", exc)
         status = getattr(exc, "status_code", None) or getattr(getattr(exc, "resp", None), "status", 502)
@@ -127,7 +138,7 @@ def fetch_recent_messages(limit: int = 20) -> List[Dict[str, Any]]:
             message = (
                 service.users()
                 .messages()
-                .get(userId="me", id=msg_id, format="metadata")
+                .get(userId="me", id=msg_id, format="metadata", metadataHeaders=["Subject", "From", "Date"])
                 .execute()
                 or {}
             )
@@ -135,12 +146,26 @@ def fetch_recent_messages(limit: int = 20) -> List[Dict[str, Any]]:
             logger.warning("Skipping message %s due to fetch error: %s", msg_id, exc)
             continue
 
+        headers = message.get("payload", {}).get("headers", []) or []
+        date_header = _extract_header(headers, "Date")
+        internal_ms = message.get("internalDate")
+        iso_date = None
+        if internal_ms:
+            try:
+                iso_date = datetime.fromtimestamp(int(internal_ms) / 1000, tz=timezone.utc).isoformat()
+            except Exception:
+                iso_date = None
+
         messages.append(
             {
                 "id": message.get("id", msg_id),
                 "threadId": message.get("threadId"),
-                "internalDate": message.get("internalDate"),
+                "internalDate": iso_date or date_header,
+                "date": date_header,
+                "from": _extract_header(headers, "From"),
+                "subject": _extract_header(headers, "Subject"),
                 "snippet": message.get("snippet", ""),
+                "gmail_labels": message.get("labelIds", []) or [],
             }
         )
 
@@ -185,4 +210,6 @@ def fetch_message_detail(message_id: str) -> Dict[str, Any]:
         "date": _extract_header(headers, "Date"),
         "snippet": message.get("snippet", ""),
         "body": body_text,
+        "gmail_labels": message.get("labelIds", []) or [],
+        "auth_results": _parse_authentication_results(headers),
     }

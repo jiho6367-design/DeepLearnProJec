@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
@@ -11,6 +12,7 @@ os.environ.setdefault("PYTHONUTF8", "1")
 
 from mail_service import GmailAuthError, get_unread_emails
 from optimized_pipeline import analyze_emails
+from history_store import init_db, save_analysis_result
 
 DEFAULT_POLICY = """
 - Gmail 분류 결과(SPAM/IMPORTANT)를 참고하되 그대로 신뢰하지 않는다.
@@ -51,6 +53,7 @@ def _as_prompt_text(email: Dict[str, Any]) -> str:
 def fetch_and_analyze_unread(max_results: int = 5) -> List[Dict[str, Any]]:
     """Fetch unread Gmail messages, enrich with signals, and analyze with the pipeline."""
 
+    init_db()
     emails = get_unread_emails(max_results=max_results)
     if not emails:
         return []
@@ -61,15 +64,21 @@ def fetch_and_analyze_unread(max_results: int = 5) -> List[Dict[str, Any]]:
 
     combined: List[Dict[str, Any]] = []
     for meta, analysis in zip(emails, model_outputs):
-        combined.append(
-            {
-                **meta,
-                "label": analysis.get("label"),
-                "confidence": analysis.get("confidence"),
-                "feedback": analysis.get("feedback"),
-                "latency_ms": analysis.get("latency_ms"),
-            }
-        )
+        now = datetime.now(timezone.utc)
+        record = {
+            **meta,
+            "label": analysis.get("label"),
+            "confidence": analysis.get("confidence"),
+            "feedback": analysis.get("feedback"),
+            "latency_ms": analysis.get("latency_ms"),
+            "timestamp": now.isoformat(),
+            "date": now.date().isoformat(),
+        }
+        combined.append(record)
+        try:
+            save_analysis_result(record)
+        except Exception:
+            pass
     return combined
 
 

@@ -8,7 +8,7 @@ import sqlite3
 import re
 import textwrap
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -28,6 +28,7 @@ from optimized_pipeline import analyze_emails
 
 from prompt_version_tracker import PromptVersionTracker, PromptRun
 from phishing_analysis import PhishingAnalysisStore, analyze_email_content
+from history_store import init_db, save_analysis_result, load_history
 
 try:
     from optimized_pipeline import classify_batch as fast_classify_batch, feedback_async as fast_feedback_async
@@ -61,6 +62,8 @@ tracker.register_prompt("v1", "Explain risk + 3 steps.")
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
 analysis_store = PhishingAnalysisStore()
+# Initialize SQLite persistence
+init_db()
 
 # ingestion_workflow 에서 사용하던 프롬프트 포맷을 동일하게 활용
 DEFAULT_POLICY = """
@@ -117,6 +120,7 @@ def require_api_token() -> Optional[str]:
 
     token = header_token or bearer
     if token != API_TOKEN:
+        print(f"[DEBUG] expected={API_TOKEN!r}, got={token!r}")
         json_abort(401, "invalid_token")
     return token
 
@@ -166,6 +170,7 @@ def build_feedback(email_text: str, label: str, score: float, email_id: str) -> 
 
     Explain briefly why the message is risky/benign and list three practical next steps.
     Avoid fear-mongering, stay factual, and assume the reader is non-technical.
+    모든 설명과 피드백 문장은 한국어로 작성하세요.
     """
     started = time.perf_counter()
     response = client.chat.completions.create(
@@ -173,7 +178,10 @@ def build_feedback(email_text: str, label: str, score: float, email_id: str) -> 
         temperature=0.2,
         max_tokens=320,
         messages=[
-            {"role": "system", "content": "You are a calm cybersecurity analyst."},
+            {
+                "role": "system",
+                "content": "You are a calm cybersecurity analyst. 모든 설명과 피드백은 한국어로 작성하세요.",
+            },
             {"role": "user", "content": textwrap.dedent(prompt).strip()},
         ],
     )
@@ -220,12 +228,15 @@ def feedback_summary() -> Dict[str, Any]:
 
 def serialize_result(label: str, confidence: float, feedback: str) -> Dict[str, Any]:
     needs_review = label == "phishing" and confidence >= THRESHOLD
+    now = datetime.now(timezone.utc)
     return {
         "label": label,
         "confidence": round(confidence, 4),
         "needs_human_review": needs_review,
         "threshold": THRESHOLD,
         "gpt_feedback": feedback,
+        "timestamp": now.isoformat(),
+        "date": now.date().isoformat(),
     }
 
 
@@ -242,8 +253,22 @@ def analyze():
     text = "\n".join(part for part in (title, body) if part)
     label, confidence = classify_email(text)
     email_id = generate_email_id(title + body)
-    feedback, _ = build_feedback(text, label, confidence, email_id)
+    feedback, latency_ms = build_feedback(text, label, confidence, email_id)
     result = serialize_result(label, confidence, feedback)
+    # Persist analysis result (response shape unchanged)
+    combined_for_db = {
+        **result,
+        "id": email_id,
+        "subject": title,
+        "body": body,
+        "gmail_labels": [],
+        "auth_results": {},
+        "latency_ms": latency_ms,
+    }
+    try:
+        save_analysis_result(combined_for_db)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Failed to persist analysis result: %s", exc)
     return jsonify(result), 200
 
 
@@ -288,11 +313,14 @@ def analyze_batch():
                 needs_review = cls["label"] == "phishing" and cls["confidence"] >= THRESHOLD
                 log_prompt_run(entry["email_id"], cls["label"], fb["latency_ms"])
                 results[entry["index"]] = {
+                    "id": entry["email_id"],
                     "label": cls["label"],
                     "confidence": round(cls["confidence"], 4),
                     "needs_human_review": needs_review,
                     "threshold": THRESHOLD,
                     "gpt_feedback": fb["content"],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "date": datetime.now(timezone.utc).date().isoformat(),
                 }
         except Exception:
             use_fast = False
@@ -300,11 +328,24 @@ def analyze_batch():
     if not use_fast:
         for entry in prepared:
             label, confidence = classify_email(entry["text"])
-            feedback, _ = build_feedback(entry["text"], label, confidence, entry["email_id"])
-            results[entry["index"]] = serialize_result(label, confidence, feedback)
+            feedback, latency_ms = build_feedback(entry["text"], label, confidence, entry["email_id"])
+            results[entry["index"]] = {
+                "id": entry["email_id"],
+                **serialize_result(label, confidence, feedback),
+                "latency_ms": latency_ms,
+            }
 
     for idx, message in errors.items():
         results[idx] = {"error": message}
+
+    # Persist batch results (best-effort)
+    for result in results:
+        if not result or "error" in result:
+            continue
+        try:
+            save_analysis_result(result)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.exception("Failed to persist batch analysis result: %s", exc)
 
     return jsonify({"results": results}), 200
 
@@ -345,16 +386,91 @@ def fetch_and_analyze():
 
     results = []
     for meta, analysis in zip(emails, model_outputs):
+        now = datetime.now(timezone.utc)
+        record_id = meta.get("id") or generate_email_id(meta.get("subject", "") or "")
+        combined = {
+            **meta,
+            "id": record_id,
+            "label": analysis.get("label"),
+            "confidence": round(analysis.get("confidence", 0.0), 4),
+            "feedback": analysis.get("feedback"),
+            "latency_ms": analysis.get("latency_ms"),
+            "timestamp": now.isoformat(),
+            "date": now.date().isoformat(),
+        }
+        results.append(combined)
+        try:
+            save_analysis_result(combined)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.exception("Failed to persist analysis result: %s", exc)
+
+    return jsonify({"results": results}), 200
+
+
+@app.post("/api/analyze_selected")
+def analyze_selected():
+    require_api_token()
+
+    payload = request.get_json(force=True, silent=True) or {}
+    message_ids = payload.get("message_ids") or []
+    if not isinstance(message_ids, list) or not message_ids:
+        return jsonify({"error": "message_ids must be a non-empty list"}), 400
+
+    try:
+        max_results = int(payload.get("max_results", len(message_ids)))
+    except (TypeError, ValueError):
+        max_results = len(message_ids)
+    max_results = max(1, min(max_results, 100))
+
+    selected_ids = message_ids[:max_results]
+    emails: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    for msg_id in selected_ids:
+        try:
+            detail = fetch_message_detail(msg_id)
+        except (GmailAuthError, GmailClientError, RuntimeError) as exc:
+            warnings.append(f"Failed to fetch message {msg_id}: {exc}")
+            continue
+        emails.append(
+            {
+                "id": detail.get("id", msg_id),
+                "subject": detail.get("subject", ""),
+                "body": detail.get("body", ""),
+                "gmail_labels": detail.get("gmail_labels", []),
+                "auth_results": detail.get("auth_results", {}),
+                "attachments": [],
+            }
+        )
+
+    if not emails:
+        return jsonify({"error": "no_messages_analyzed", "warnings": warnings}), 502
+
+    texts = [_as_prompt_text(email) for email in emails]
+    os.environ.setdefault("PHISHING_POLICY", DEFAULT_POLICY)
+    model_outputs = analyze_emails(texts)
+
+    results = []
+    for meta, analysis in zip(emails, model_outputs):
+        now = datetime.now(timezone.utc)
         combined = {
             **meta,
             "label": analysis.get("label"),
             "confidence": round(analysis.get("confidence", 0.0), 4),
             "feedback": analysis.get("feedback"),
             "latency_ms": analysis.get("latency_ms"),
+            "timestamp": now.isoformat(),
+            "date": now.date().isoformat(),
         }
         results.append(combined)
+        try:
+            save_analysis_result(combined)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.exception("Failed to persist selected analysis result: %s", exc)
 
-    return jsonify({"results": results}), 200
+    response_body: Dict[str, Any] = {"results": results}
+    if warnings:
+        response_body["warnings"] = warnings
+    return jsonify(response_body), 200
 
 
 @app.post("/api/emails/<message_id>/analyze")
@@ -394,6 +510,46 @@ def analyze_gmail_email(message_id: str):
 
     analysis_store.save(response_body)
     return jsonify(response_body), 200
+
+
+@app.get("/api/list_emails")
+def list_gmail_emails():
+    require_api_token()
+
+    try:
+        max_results = int(request.args.get("max_results", 20))
+    except (TypeError, ValueError):
+        max_results = 20
+    max_results = max(1, min(max_results, 100))
+    label = request.args.get("label") or None
+
+    try:
+        messages = fetch_recent_messages(limit=max_results, label=label)
+    except GmailAuthError as exc:
+        logger.error("Gmail configuration error: %s", exc)
+        return jsonify({"error": "gmail_configuration", "detail": str(exc)}), 500
+    except GmailClientError as exc:
+        logger.error("Gmail API error while listing messages: %s", exc)
+        return jsonify({"error": str(exc)}), getattr(exc, "status_code", 502)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected failure listing Gmail messages: %s", exc)
+        return jsonify({"error": "internal_error"}), 500
+
+    results = []
+    for msg in messages:
+        results.append(
+            {
+                "gmail_id": msg.get("id"),
+                "thread_id": msg.get("threadId"),
+                "date": msg.get("internalDate") or msg.get("date"),
+                "from": msg.get("from") or msg.get("sender"),
+                "subject": msg.get("subject", ""),
+                "snippet": msg.get("snippet", ""),
+                "gmail_labels": msg.get("gmail_labels", []),
+            }
+        )
+
+    return jsonify({"results": results}), 200
 
 @app.get("/api/emails")
 def list_emails():
@@ -439,6 +595,24 @@ def get_email_detail(message_id: str):
 @app.get("/metrics/summary")
 def metrics_summary():
     return jsonify(feedback_summary())
+
+
+@app.get("/api/history")
+def get_history():
+    require_api_token()
+
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (TypeError, ValueError):
+        limit = 200
+    days_param = request.args.get("days")
+    try:
+        days = int(days_param) if days_param is not None else None
+    except (TypeError, ValueError):
+        days = None
+
+    results = load_history(limit=limit, days=days)
+    return jsonify({"results": results})
 
 
 if __name__ == "__main__":
