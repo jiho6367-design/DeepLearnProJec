@@ -222,6 +222,77 @@ if st.button("Fetch & Analyze Emails"):
                     st.cache_data.clear()  # clear cached history
                     history_list = load_history_from_api(API_TOKEN)  # reload fresh history
 
+# --- Browse & Select Emails ----------------------------------------------
+st.subheader("Browse & Select Emails")
+select_max = st.number_input("Max emails to load", min_value=1, max_value=50, value=20, step=1)
+label_filter = st.selectbox("Label filter", ["ALL", "INBOX", "UNREAD"], index=0)
+
+if "email_list" not in st.session_state:
+    st.session_state["email_list"] = []
+if "selected_message_ids" not in st.session_state:
+    st.session_state["selected_message_ids"] = []
+
+if st.button("Load Email List"):
+    try:
+        params = {"max_results": int(select_max)}
+        if label_filter != "ALL":
+            params["label"] = label_filter
+        resp = requests.get(f"{API_BASE}/api/list_emails", headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", "n/a")
+        st.error(f"Failed to load email list: {e} (status {status})")
+    except requests.RequestException as e:
+        st.error("Failed to load email list: " + str(e))
+    except ValueError:
+        st.error("Email list response was not valid JSON.")
+    else:
+        st.session_state["email_list"] = data.get("results", [])
+
+email_list = st.session_state.get("email_list", [])
+selected_ids: list[str] = []
+if email_list:
+    emails_df = pd.DataFrame(email_list)
+    if "selected" not in emails_df:
+        emails_df.insert(0, "selected", False)
+    edited_df = st.data_editor(
+        emails_df,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={"selected": st.column_config.CheckboxColumn("selected")},
+    )
+    selected_ids = edited_df.loc[edited_df["selected"], "gmail_id"].tolist()
+    st.session_state["selected_message_ids"] = selected_ids
+
+if st.button("Analyze Selected Emails"):
+    selected_ids = st.session_state.get("selected_message_ids", [])
+    if not selected_ids:
+        st.warning("No emails selected.")
+    else:
+        with st.spinner("Analyzing selected emails..."):
+            try:
+                resp = requests.post(
+                    f"{API_BASE}/api/analyze_selected",
+                    headers=headers,
+                    json={"message_ids": selected_ids},
+                    timeout=60,
+                )
+            except requests.RequestException as e:
+                st.error("API connection failed: " + str(e))
+            else:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    st.error("API response was not valid JSON.")
+                else:
+                    if resp.status_code >= 400:
+                        st.error(f"API error({resp.status_code}): {data}")
+                    else:
+                        st.success(f"Analyzed {len(data.get('results', []))} selected emails.")
+                        st.cache_data.clear()
+                        history_list = load_history_from_api(API_TOKEN)
+
 # If not refreshed in the button block, load cached/fresh history now
 if history_list is None:
     history_list = load_history_from_api(API_TOKEN)
