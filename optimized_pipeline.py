@@ -68,14 +68,18 @@ Email:
 
 Verdict: {item['label']} ({item['confidence']:.2%})
 
-Explain briefly why/why not it is risky, cite the policy items you used, and give three safe actions."""
+Explain briefly why/why not it is risky, cite the policy items you used, and give three safe actions.
+모든 설명과 피드백 문장은 한국어로 작성하세요."""
         started = time.perf_counter()
         resp = await async_client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             temperature=0.2,
             max_tokens=320,
             messages=[
-                {"role": "system", "content": "You are a concise cybersecurity analyst."},
+                {
+                    "role": "system",
+                    "content": "You are a concise cybersecurity analyst. 모든 설명과 피드백은 한국어로 작성하세요.",
+                },
                 {"role": "user", "content": prompt},
             ],
         )
