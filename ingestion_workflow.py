@@ -3,14 +3,20 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List
 
+from dotenv import load_dotenv
+
+# .env를 먼저 로드해야 OpenAI/Gmail 키가 optimized_pipeline 초기화 전에 적용됨
+load_dotenv(".env")
+os.environ.setdefault("PYTHONUTF8", "1")
+
 from mail_service import GmailAuthError, get_unread_emails
 from optimized_pipeline import analyze_emails
 
 DEFAULT_POLICY = """
-- Gmail 분류(SPAM, IMPORTANT)와 사용자 신고 여부를 참고한다.
-- SPF/DKIM/DMARC 검증 실패, 링크/첨부파일 존재 여부를 위험 신호로 본다.
-- 발신자·도메인 위장, 급박/금전 요청, 로그인 유도 링크 등 사회공학 패턴을 최우선 점검한다.
-- 조직 정책에 따라 의심 단계(격리/모니터링/허용)를 명시적으로 제안한다.
+- Gmail 분류 결과(SPAM/IMPORTANT)를 참고하되 그대로 신뢰하지 않는다.
+- SPF/DKIM/DMARC가 실패하거나 링크·첨부 파일이 있으면 위험 점수를 높인다.
+- 발신자/도메인 위장, 급박/금전 요구, 로그인/다운로드 링크의 사회공학 패턴을 우선 검토한다.
+- 조직 보안 정책에 맞춰 격리/모니터링/사용자 알림 등 후속 조치를 명시한다.
 """
 
 
@@ -76,10 +82,10 @@ if __name__ == "__main__":
     try:
         reports = fetch_and_analyze_unread(max_results=limit)
     except GmailAuthError as exc:
-        raise SystemExit(f"⚠️ Gmail 자격 증명이 누락되었습니다: {exc}")
+        raise SystemExit(f"❌ Gmail OAuth2 자격 증명이 환경 변수에서 로드되지 않았습니다: {exc}")
 
     if not reports:
-        print("새로운 읽지 않은 메일이 없습니다.")
+        print("새로 확인할 메일이 없습니다.")
     for report in reports:
         print("=" * 60)
         print(f"Subject: {report.get('subject')}")

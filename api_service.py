@@ -8,7 +8,7 @@ import sqlite3
 import re
 import textwrap
 import time
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -17,13 +17,14 @@ import torch.nn.functional as F
 from flask import Flask, jsonify, request, abort
 from openai import OpenAI
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
-from gmail_client import fetch_message_detail
+from dotenv import load_dotenv
 from mail_service import GmailAuthError, get_unread_emails
 from server.gmail_client import (
     GmailClientError,
     fetch_message_detail,
     fetch_recent_messages,
 )
+from optimized_pipeline import analyze_emails
 
 from prompt_version_tracker import PromptVersionTracker, PromptRun
 from phishing_analysis import PhishingAnalysisStore, analyze_email_content
@@ -34,12 +35,15 @@ except Exception:
     fast_classify_batch = None
     fast_feedback_async = None
 
+load_dotenv(".env")
+os.environ.setdefault("PYTHONUTF8", "1")
+
 MODEL_NAME = os.getenv("HF_CLASSIFIER", "distilbert-base-uncased-finetuned-sst-2-english")
 THRESHOLD = float(os.getenv("PHISH_THRESHOLD", 0.30))
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-BILLING_DB = Path("data/billing.db")
+# API 토큰이 비어 있으면 OpenAI 키를 fallback 으로 허용해 로컬 실험 시 401을 줄인다.
+API_TOKEN = (os.getenv("PHISH_API_TOKEN", "") or os.getenv("OPENAI_API_KEY", "")).strip()
 FEEDBACK_DB = Path("data/feedback.db")
-DAILY_FREE_LIMIT = 10
 LOG_PATH = Path("logs/email_analysis.log")
 SUSPICIOUS_PATTERN = re.compile(r"(zip|exe|docm|xlsm|scr|bat)", re.IGNORECASE)
 
@@ -58,11 +62,63 @@ app = Flask(__name__)
 logger = logging.getLogger(__name__)
 analysis_store = PhishingAnalysisStore()
 
+# ingestion_workflow 에서 사용하던 프롬프트 포맷을 동일하게 활용
+DEFAULT_POLICY = """
+- Gmail 분류 결과(SPAM/IMPORTANT)를 참고하되 그대로 신뢰하지 않는다.
+- SPF/DKIM/DMARC가 실패하거나 링크·첨부 파일이 있으면 위험 점수를 높인다.
+- 발신자/도메인 위장, 급박/금전 요구, 로그인/다운로드 링크의 사회공학 패턴을 우선 검토한다.
+- 조직 보안 정책에 맞춰 격리/모니터링/사용자 알림 등 후속 조치를 명시한다.
+"""
+
+
+def _format_signals(email: Dict[str, Any]) -> str:
+    auth = email.get("auth_results", {}) or {}
+    labels = email.get("gmail_labels", []) or []
+    attachments = email.get("attachments", []) or []
+
+    auth_line = (
+        f"SPF={'pass' if auth.get('spf_pass') else 'fail/unknown'}, "
+        f"DKIM={'pass' if auth.get('dkim_pass') else 'fail/unknown'}, "
+        f"DMARC={'pass' if auth.get('dmarc_pass') else 'fail/unknown'}"
+    )
+    attachment_line = ", ".join(att.get("filename", "") for att in attachments) or "none"
+    label_line = ", ".join(labels) if labels else "none"
+
+    return (
+        f"- Gmail labels: {label_line}\n"
+        f"- Auth: {auth_line}\n"
+        f"- Attachments: {attachment_line}"
+    )
+
+
+def _as_prompt_text(email: Dict[str, Any]) -> str:
+    return (
+        f"Subject: {email.get('subject', '').strip()}\n\n"
+        f"Body:\n{email.get('body', '').strip()}\n\n"
+        f"Signals:\n{_format_signals(email)}"
+    )
+
 
 def json_abort(status: int, message: str):
     response = jsonify({"error": message})
     response.status_code = status
     abort(response)
+
+
+def require_api_token() -> Optional[str]:
+    """Require API token if configured; accept X-API-Key or Authorization: Bearer."""
+    if not API_TOKEN:
+        return None
+
+    header_token = (request.headers.get("X-API-Key") or "").strip()
+    bearer = (request.headers.get("Authorization") or "").strip()
+    if bearer.lower().startswith("bearer "):
+        bearer = bearer[7:].strip()
+
+    token = header_token or bearer
+    if token != API_TOKEN:
+        json_abort(401, "invalid_token")
+    return token
 
 
 def classify_email(text: str):
@@ -96,7 +152,7 @@ def log_prompt_run(email_id: str, label: str, latency_ms: float) -> None:
 
 
 def log_email_analysis(token: str, email_id: str, label: str, confidence: float, reason: str) -> None:
-    entry = f"{datetime.utcnow().isoformat()}	{email_id}	{label}	{confidence:.4f}	{token}	{reason}\n"
+    entry = f"{datetime.utcnow().isoformat()}	{email_id}	{label}	{confidence:.4f}	{token or 'anonymous'}	{reason}\n"
     with LOG_PATH.open("a", encoding="utf-8") as log_file:
         log_file.write(entry)
 
@@ -124,47 +180,6 @@ def build_feedback(email_text: str, label: str, score: float, email_id: str) -> 
     latency_ms = (time.perf_counter() - started) * 1000
     log_prompt_run(email_id, label, latency_ms)
     return response.choices[0].message.content.strip(), latency_ms
-
-
-def verify_and_meter(token: Optional[str], cost: int = 1):
-    if not token:
-        json_abort(401, "missing_token")
-    if not BILLING_DB.exists():
-        json_abort(503, "billing_unavailable")
-    cost = max(1, int(cost))
-
-    with sqlite3.connect(BILLING_DB) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """SELECT users.* FROM api_tokens
-               JOIN users ON users.id = api_tokens.user_id
-               WHERE api_tokens.token = ?""",
-            (token,),
-        ).fetchone()
-        if not row:
-            json_abort(401, "invalid_token")
-        row = dict(row)
-        today = date.today().isoformat()
-        if row.get("usage_reset_on") != today:
-            conn.execute(
-                "UPDATE users SET daily_usage = 0, usage_reset_on = ? WHERE id = ?",
-                (today, row["id"]),
-            )
-            row["daily_usage"] = 0
-
-        remaining = None
-        if row["plan"] == "free":
-            if row["daily_usage"] + cost > DAILY_FREE_LIMIT:
-                json_abort(402, "limit")
-            remaining = DAILY_FREE_LIMIT - (row["daily_usage"] + cost)
-
-        conn.execute(
-            "UPDATE users SET daily_usage = daily_usage + ?, usage_reset_on = ? WHERE id = ?",
-            (cost, today, row["id"]),
-        )
-        conn.commit()
-
-    return row, remaining
 
 
 def feedback_summary() -> Dict[str, Any]:
@@ -222,15 +237,13 @@ def analyze():
     if not (title or body):
         return jsonify({"error": "title or body is required"}), 400
 
-    token = request.headers.get("X-API-Key")
-    _, remaining = verify_and_meter(token)
+    token = require_api_token()
 
     text = "\n".join(part for part in (title, body) if part)
     label, confidence = classify_email(text)
     email_id = generate_email_id(title + body)
     feedback, _ = build_feedback(text, label, confidence, email_id)
     result = serialize_result(label, confidence, feedback)
-    result["remaining_free_calls"] = remaining
     return jsonify(result), 200
 
 
@@ -261,8 +274,7 @@ def analyze_batch():
     if not prepared:
         return jsonify({"error": "no valid items"}), 400
 
-    token = request.headers.get("X-API-Key")
-    _, remaining = verify_and_meter(token, cost=len(prepared))
+    token = require_api_token()
 
     results: List[Optional[Dict[str, Any]]] = [None] * len(items)
 
@@ -294,7 +306,7 @@ def analyze_batch():
     for idx, message in errors.items():
         results[idx] = {"error": message}
 
-    return jsonify({"results": results, "remaining_free_calls": remaining}), 200
+    return jsonify({"results": results}), 200
 
 
 def asyncio_run_feedback(classifications: List[Dict[str, Any]]):
@@ -305,9 +317,7 @@ def asyncio_run_feedback(classifications: List[Dict[str, Any]]):
 
 @app.post("/api/fetch_and_analyze")
 def fetch_and_analyze():
-    token = request.headers.get("X-API-Key")
-    if not token:
-        json_abort(401, "missing_token")
+    token = require_api_token()
 
     payload = request.get_json(force=True, silent=True) or {}
     max_results = payload.get("max_results", 10)
@@ -326,49 +336,30 @@ def fetch_and_analyze():
         logger.error("Gmail API failure: %s", exc)
         return jsonify({"error": str(exc)}), 502
 
-    cost = max(1, len(emails))
-    _, remaining = verify_and_meter(token, cost=cost)
+    if not emails:
+        return jsonify({"results": []}), 200
+
+    texts = [_as_prompt_text(email) for email in emails]
+    os.environ.setdefault("PHISHING_POLICY", DEFAULT_POLICY)
+    model_outputs = analyze_emails(texts)
 
     results = []
-    for email in emails:
-        subject = email.get("subject") or ""
-        body = email.get("body") or ""
-        text = "\n".join(part for part in (subject, body) if part) or "(empty)"
-        label, confidence = classify_email(text)
+    for meta, analysis in zip(emails, model_outputs):
+        combined = {
+            **meta,
+            "label": analysis.get("label"),
+            "confidence": round(analysis.get("confidence", 0.0), 4),
+            "feedback": analysis.get("feedback"),
+            "latency_ms": analysis.get("latency_ms"),
+        }
+        results.append(combined)
 
-        reason_parts = []
-        attachments = email.get("attachments") or []
-        for attachment in attachments:
-            filename = attachment.get("filename") or ""
-            if SUSPICIOUS_PATTERN.search(filename):
-                reason_parts.append("contains suspicious attachment")
-                break
-        if SUSPICIOUS_PATTERN.search(body):
-            reason_parts.append("contains suspicious keywords")
-
-        if reason_parts:
-            confidence = min(1.0, confidence + 0.1)
-        reason = "; ".join(reason_parts) if reason_parts else "model verdict"
-
-        log_email_analysis(token, email.get("id", "unknown"), label, confidence, reason)
-
-        results.append(
-            {
-                "id": email.get("id"),
-                "label": label,
-                "confidence": round(confidence, 4),
-                "reason": reason,
-            }
-        )
-
-    return jsonify({"results": results, "remaining_free_calls": remaining}), 200
+    return jsonify({"results": results}), 200
 
 
-<<<<<<< ours
 @app.post("/api/emails/<message_id>/analyze")
 def analyze_gmail_email(message_id: str):
-    token = request.headers.get("X-API-Key")
-    _, remaining = verify_and_meter(token)
+    token = require_api_token()
 
     try:
         email = fetch_message_detail(message_id)
@@ -399,12 +390,11 @@ def analyze_gmail_email(message_id: str):
         "riskScore": int(analysis.get("risk_score", 0)),
         "reasons": analysis.get("reasons", []),
         "summary": analysis.get("summary", ""),
-        "remaining_free_calls": remaining,
     }
 
     analysis_store.save(response_body)
     return jsonify(response_body), 200
-=======
+
 @app.get("/api/emails")
 def list_emails():
     try:
@@ -444,7 +434,6 @@ def get_email_detail(message_id: str):
         return jsonify({"error": "internal_error"}), 500
 
     return jsonify(detail), 200
->>>>>>> theirs
 
 
 @app.get("/metrics/summary")

@@ -17,7 +17,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 tokenizer = AutoTokenizer.from_pretrained(FAST_MODEL, use_fast=True)
 model = AutoModelForSequenceClassification.from_pretrained(
     FAST_MODEL,
-    torch_dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32,
+    dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32,
 ).to(DEVICE).eval()
 
 async_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))

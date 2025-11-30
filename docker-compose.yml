@@ -10,17 +10,6 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       PHISH_THRESHOLD: ${PHISH_THRESHOLD:-0.30}
 
-  billing:
-    build: .
-    command: python billing_service.py
-    ports:
-      - "5001:5001"
-    volumes:
-      - ./data:/app/data
-    environment:
-      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
-      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
-
   dashboard:
     build: .
     command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0

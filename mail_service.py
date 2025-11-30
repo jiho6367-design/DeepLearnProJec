@@ -22,7 +22,9 @@ def _get_credentials() -> Credentials:
     refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN")
 
     if not all([client_id, client_secret, refresh_token]):
-        raise GmailAuthError("Gmail OAuth2 credentials are missing in environment variables.")
+        raise GmailAuthError(
+            "Missing Gmail OAuth2 env vars (GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET/GOOGLE_REFRESH_TOKEN)."
+        )
 
     return Credentials(
         token=None,

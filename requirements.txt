@@ -6,7 +6,6 @@ openai
 pandas
 altair
 requests
-stripe
 reportlab
 gunicorn
 google-api-python-client
