@@ -1,6 +1,7 @@
 import json
 import os
 import math
+import time
 
 import altair as alt
 import pandas as pd
@@ -66,18 +67,62 @@ def fetch_summary(token: str):
 def load_history_from_api(token: str, limit: int = 300):
     """Short-lived cache to pull analysis history from backend DB."""
     headers = {"X-API-Key": token} if token else {}
+    resp = call_api_with_retry(
+        "GET",
+        f"{API_BASE}/api/history",
+        headers=headers,
+        params={"limit": limit},
+        timeout=12,
+        retries=2,
+        backoff_sec=2,
+    )
+    if resp is None:
+        st.warning("Could not load history (timed out). Please ensure api_service.py is running and try again.")
+        return []
     try:
-        resp = requests.get(f"{API_BASE}/api/history?limit={limit}", headers=headers, timeout=5)
         resp.raise_for_status()
         return resp.json().get("results", [])
     except requests.HTTPError as e:
         status = getattr(e.response, "status_code", "n/a")
         st.warning(f"Could not load history: {e} (status {status})")
-    except requests.RequestException as e:
-        st.warning("Could not load history: " + str(e))
     except ValueError:
         st.warning("History response was not valid JSON.")
     return []
+
+
+def call_api_with_retry(
+    method: str,
+    url: str,
+    *,
+    headers=None,
+    params=None,
+    json=None,
+    timeout: float = 30,
+    retries: int = 2,
+    backoff_sec: float = 2,
+):
+    """Lightweight retry helper to reduce transient timeouts."""
+    attempts = retries + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                params=params,
+                json=json,
+                timeout=timeout,
+            )
+            return resp
+        except requests.exceptions.Timeout:
+            if attempt >= attempts:
+                break
+            time.sleep(backoff_sec)
+        except requests.exceptions.RequestException:
+            if attempt >= attempts:
+                break
+            time.sleep(backoff_sec)
+    return None
 
 
 # --- helpers ---------------------------------------------------------------
@@ -121,7 +166,7 @@ def compute_kpis_from_results(df: pd.DataFrame):
 
 def build_trend_chart(df: pd.DataFrame):
     if df.empty:
-        return None, "No data yet. Run 'Fetch & Analyze Emails' to populate the trend."
+        return None, "No data yet. Analyze some emails first in the 'Analyze Emails' tab."
 
     dt_series = extract_datetime_series(df)
     if dt_series is None or dt_series.isna().all():
@@ -172,222 +217,231 @@ def build_summary_table(df: pd.DataFrame):
 
 
 # --- Upload single email --------------------------------------------------
-st.subheader("Upload Suspicious Email")
-uploaded = st.file_uploader(".eml/.txt file upload", type=["txt", "eml"])
-subject = st.text_input("Subject override (optional)")
-if uploaded:
-    email_body = uploaded.read().decode(errors="ignore")
-    payload = {"title": subject, "body": email_body}
-    with st.spinner("Analyzing..."):
-        try:
-            resp = requests.post(f"{API_BASE}/api/analyze", json=payload, headers=headers, timeout=15)
-        except requests.RequestException as e:
-            st.error("API connection failed: " + str(e))
-        else:
-            try:
-                data = resp.json()
-            except ValueError:
-                st.error("API response was not valid JSON.")
-            else:
-                if resp.status_code >= 400:
-                    st.error(f"API error({resp.status_code}): {data}")
-                else:
-                    st.json(data)
+# --- Tabs layout ----------------------------------------------------------
+tab_analyze, tab_archive = st.tabs(["Analyze Emails", "Analysis Archive"])
 
-# --- Fetch & analyze in bulk ---------------------------------------------
-st.subheader("Fetch & Analyze Emails")
-max_results = st.number_input("Max emails to analyze", min_value=1, max_value=50, value=5, step=1)
-history_list = None
-if st.button("Fetch & Analyze Emails"):
-    with st.spinner("Fetching from Gmail and analyzing..."):
-        try:
-            resp = requests.post(
-                f"{API_BASE}/api/fetch_and_analyze",
-                json={"max_results": int(max_results)},
+with tab_analyze:
+    # Upload single email
+    st.subheader("Upload Suspicious Email")
+    uploaded = st.file_uploader(".eml/.txt file upload", type=["txt", "eml"])
+    subject = st.text_input("Subject override (optional)")
+    if uploaded:
+        email_body = uploaded.read().decode(errors="ignore")
+        payload = {"title": subject, "body": email_body}
+        with st.spinner("Analyzing..."):
+            resp = call_api_with_retry(
+                "POST",
+                f"{API_BASE}/api/analyze",
                 headers=headers,
-                timeout=30,
+                json=payload,
+                timeout=25,
+                retries=2,
+                backoff_sec=2,
             )
-        except requests.RequestException as e:
-            st.error("API connection failed: " + str(e))
-        else:
-            try:
-                data = resp.json()
-            except ValueError:
-                st.error("API response was not valid JSON.")
-            else:
-                if resp.status_code >= 400:
-                    st.error(f"API error({resp.status_code}): {data}")
-                else:
-                    st.success(f"Analyzed {len(data.get('results', []))} emails.")
-                    st.cache_data.clear()  # clear cached history
-                    history_list = load_history_from_api(API_TOKEN)  # reload fresh history
-
-# --- Browse & Select Emails ----------------------------------------------
-st.subheader("Browse & Select Emails")
-select_max = st.number_input("Max emails to load", min_value=1, max_value=50, value=20, step=1)
-LABEL_CHOICES = [
-    "ALL",
-    "INBOX",
-    "UNREAD",
-    "CATEGORY_PROMOTIONS",
-    "CATEGORY_UPDATES",
-    "CATEGORY_SOCIAL",
-]
-label_filter = st.selectbox("Label filter", LABEL_CHOICES, index=0)
-
-if "email_list" not in st.session_state:
-    st.session_state["email_list"] = []
-if "selected_message_ids" not in st.session_state:
-    st.session_state["selected_message_ids"] = []
-
-if st.button("Load Email List"):
-    try:
-        params = {"max_results": int(select_max)}
-        if label_filter != "ALL":
-            params["label"] = label_filter
-        resp = requests.get(f"{API_BASE}/api/list_emails", headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.HTTPError as e:
-        status = getattr(e.response, "status_code", "n/a")
-        st.error(f"Failed to load email list: {e} (status {status})")
-    except requests.RequestException as e:
-        st.error("Failed to load email list: " + str(e))
-    except ValueError:
-        st.error("Email list response was not valid JSON.")
-    else:
-        st.session_state["email_list"] = data.get("results", [])
-
-email_list = st.session_state.get("email_list", [])
-selected_ids: list[str] = []
-if email_list:
-    emails_df = pd.DataFrame(email_list)
-    if "selected" not in emails_df:
-        emails_df.insert(0, "selected", False)
-    edited_df = st.data_editor(
-        emails_df,
-        use_container_width=True,
-        num_rows="fixed",
-        column_config={"selected": st.column_config.CheckboxColumn("selected")},
-    )
-    selected_ids = edited_df.loc[edited_df["selected"], "gmail_id"].tolist()
-    st.session_state["selected_message_ids"] = selected_ids
-
-if st.button("Analyze Selected Emails"):
-    selected_ids = st.session_state.get("selected_message_ids", [])
-    if not selected_ids:
-        st.warning("No emails selected.")
-    else:
-        with st.spinner("Analyzing selected emails..."):
-            try:
-                resp = requests.post(
-                    f"{API_BASE}/api/analyze_selected",
-                    headers=headers,
-                    json={"message_ids": selected_ids},
-                    timeout=90,
-                )
-            except requests.RequestException as e:
-                st.error("API connection failed: " + str(e))
+            if resp is None:
+                st.warning("API timed out after multiple retries. Please check api_service.py and try again.")
             else:
                 try:
                     data = resp.json()
                 except ValueError:
-                    st.error("API response was not valid JSON.")
+                    st.warning("API response was not valid JSON.")
                 else:
                     if resp.status_code >= 400:
-                        st.error(f"API error({resp.status_code}): {data}")
+                        st.warning(f"API error({resp.status_code}): {data}")
                     else:
-                        st.success(f"Analyzed {len(data.get('results', []))} selected emails.")
-                        st.cache_data.clear()
-                        history_list = load_history_from_api(API_TOKEN)
+                        st.json(data)
 
-# If not refreshed in the button block, load cached/fresh history now
-if history_list is None:
+    # Browse & Select Emails
+    st.subheader("Browse & Select Emails")
+    select_max = st.number_input("Max emails to load", min_value=1, max_value=50, value=20, step=1)
+    LABEL_CHOICES = [
+        "ALL",
+        "INBOX",
+        "UNREAD",
+        "CATEGORY_PROMOTIONS",
+        "CATEGORY_UPDATES",
+        "CATEGORY_SOCIAL",
+    ]
+    label_filter = st.selectbox("Label filter", LABEL_CHOICES, index=2)
+
+    if "email_list" not in st.session_state:
+        st.session_state["email_list"] = []
+    if "selected_message_ids" not in st.session_state:
+        st.session_state["selected_message_ids"] = []
+
+    hide_analyzed = st.checkbox(
+        "Hide emails that have already been analyzed",
+        value=True,
+        help="Uses the analysis history to hide Gmail messages that are already stored in the archive.",
+    )
+
+    if st.button("Load Email List"):
+        params = {"max_results": int(select_max)}
+        if label_filter != "ALL":
+            params["label"] = label_filter
+        resp = call_api_with_retry(
+            "GET",
+            f"{API_BASE}/api/list_emails",
+            headers=headers,
+            params=params,
+            timeout=25,
+            retries=2,
+            backoff_sec=2,
+        )
+        if resp is None:
+            st.warning("Failed to load email list (timed out). Please ensure api_service.py is running and try again.")
+        else:
+            try:
+                resp.raise_for_status()
+                data = resp.json()
+            except requests.HTTPError as e:
+                status = getattr(e.response, "status_code", "n/a")
+                st.warning(f"Failed to load email list: {e} (status {status})")
+            except ValueError:
+                st.warning("Email list response was not valid JSON.")
+            else:
+                results = data.get("results", [])
+                if hide_analyzed:
+                    history_list = load_history_from_api(API_TOKEN)
+                    analyzed_ids = {row.get("gmail_id") for row in history_list if row.get("gmail_id")}
+                    results = [msg for msg in results if msg.get("gmail_id") not in analyzed_ids]
+                st.session_state["email_list"] = results
+
+    email_list = st.session_state.get("email_list", [])
+    selected_ids: list[str] = []
+    if email_list:
+        emails_df = pd.DataFrame(email_list)
+        if "selected" not in emails_df:
+            emails_df.insert(0, "selected", False)
+        edited_df = st.data_editor(
+            emails_df,
+            use_container_width=True,
+            num_rows="fixed",
+            column_config={"selected": st.column_config.CheckboxColumn("selected")},
+        )
+        selected_ids = edited_df.loc[edited_df["selected"], "gmail_id"].tolist()
+        st.session_state["selected_message_ids"] = selected_ids
+
+    if st.button("Analyze Selected Emails"):
+        selected_ids = st.session_state.get("selected_message_ids", [])
+        if not selected_ids:
+            st.warning("No emails selected.")
+        else:
+            with st.spinner("Analyzing selected emails..."):
+                resp = call_api_with_retry(
+                    "POST",
+                    f"{API_BASE}/api/analyze_selected",
+                    headers=headers,
+                    json={"message_ids": selected_ids},
+                    timeout=90,
+                    retries=2,
+                    backoff_sec=2,
+                )
+                if resp is None:
+                    st.warning("API timed out after multiple retries. Please ensure api_service.py is running and try again.")
+                else:
+                    try:
+                        data = resp.json()
+                    except ValueError:
+                        st.warning("API response was not valid JSON.")
+                    else:
+                        if resp.status_code >= 400:
+                            st.warning(f"API error({resp.status_code}): {data}")
+                        else:
+                            st.success(f"Analyzed {len(data.get('results', []))} selected emails.")
+                            st.cache_data.clear()
+
+with tab_archive:
     history_list = load_history_from_api(API_TOKEN)
+    result_df = pd.DataFrame(history_list)
 
-# Build result_df from DB-backed history
-result_df = pd.DataFrame(history_list)
+    # KPI cards (from DB history, fallback to API summary)
+    summary = fetch_summary(API_TOKEN)
+    kpi_from_results = compute_kpis_from_results(result_df)
+    metric_phishing_today = (kpi_from_results or summary).get("phishing_today", 0)
+    metric_false_positive = (kpi_from_results or summary).get("false_positives", 0)
+    metric_avg_latency = (kpi_from_results or summary).get("avg_feedback_latency_ms", 0)
+    if metric_avg_latency is None or (isinstance(metric_avg_latency, float) and math.isnan(metric_avg_latency)):
+        metric_avg_latency = 0.0
 
-# --- KPI cards (from DB history, fallback to API summary) -----------------
-summary = fetch_summary(API_TOKEN)
-kpi_from_results = compute_kpis_from_results(result_df)
-metric_phishing_today = (kpi_from_results or summary).get("phishing_today", 0)
-metric_false_positive = (kpi_from_results or summary).get("false_positives", 0)
-metric_avg_latency = (kpi_from_results or summary).get("avg_feedback_latency_ms", 0)
-if metric_avg_latency is None or (isinstance(metric_avg_latency, float) and math.isnan(metric_avg_latency)):
-    metric_avg_latency = 0.0
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Phishing Detected (Today)", metric_phishing_today)
+    col2.metric("False Positives (Today)", metric_false_positive)
+    col3.metric("Avg GPT Latency (ms)", round(metric_avg_latency, 1))
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Phishing Detected (Today)", metric_phishing_today)
-col2.metric("False Positives (Today)", metric_false_positive)
-col3.metric("Avg GPT Latency (ms)", round(metric_avg_latency, 1))
+    # Trend chart (multi-line)
+    trend_chart, trend_msg = build_trend_chart(result_df)
+    if trend_chart is not None:
+        st.altair_chart(trend_chart, width="stretch")
+    else:
+        st.info(trend_msg)
 
-# --- Trend chart (multi-line) ---------------------------------------------
-trend_chart, trend_msg = build_trend_chart(result_df)
-if trend_chart is not None:
-    st.altair_chart(trend_chart, width="stretch")
-else:
-    st.info(trend_msg)
+    # Analyzed Email Archive (read-only)
+    st.subheader("Analyzed Email Archive")
+    archive_label_filter = st.selectbox(
+        "Filter by analysis label",
+        ["ALL", "phishing", "normal"],
+        index=0,
+    )
+    archive_subject_query = st.text_input("Subject search (contains)")
+    archive_days = st.number_input(
+        "Limit to recent N days",
+        min_value=0,
+        max_value=365,
+        value=0,
+        step=1,
+        help="0 = no limit",
+    )
 
-# --- Analyzed Email Archive (read-only) -----------------------------------
-st.subheader("Analyzed Email Archive")
-archive_label_filter = st.selectbox(
-    "Filter by analysis label",
-    ["ALL", "phishing", "normal"],
-    index=0,
-)
-archive_subject_query = st.text_input("Subject search (contains)")
-archive_days = st.number_input(
-    "Limit to recent N days",
-    min_value=0,
-    max_value=365,
-    value=0,
-    step=1,
-    help="0 = no limit",
-)
+    archive_df = result_df.copy()
+    if archive_label_filter != "ALL":
+        archive_df = archive_df[archive_df.get("label", "") == archive_label_filter]
+    if archive_subject_query:
+        archive_df = archive_df[archive_df.get("subject", "").str.contains(archive_subject_query, case=False, na=False)]
 
-archive_df = result_df.copy()
-if archive_label_filter != "ALL":
-    archive_df = archive_df[archive_df.get("label", "") == archive_label_filter]
-if archive_subject_query:
-    archive_df = archive_df[archive_df.get("subject", "").str.contains(archive_subject_query, case=False, na=False)]
+    if archive_days and archive_days > 0:
+        dt_series = extract_datetime_series(archive_df)
+        if dt_series is not None:
+            cutoff = pd.Timestamp.now(tz=dt_series.dt.tz) - pd.Timedelta(days=int(archive_days))
+            archive_df = archive_df[dt_series >= cutoff]
 
-if archive_days and archive_days > 0:
-    dt_series = extract_datetime_series(archive_df)
-    if dt_series is not None:
-        cutoff = pd.Timestamp.now(tz=dt_series.dt.tz) - pd.Timedelta(days=int(archive_days))
-        archive_df = archive_df[dt_series >= cutoff]
+    if not archive_df.empty:
+        if "confidence_pct" not in archive_df:
+            archive_df["confidence_pct"] = (archive_df.get("confidence", 0).fillna(0) * 100).round(2)
+        archive_view = archive_df[["date", "subject", "label", "confidence_pct", "gmail_labels"]].copy()
 
-if not archive_df.empty:
-    if "confidence_pct" not in archive_df:
-        archive_df["confidence_pct"] = (archive_df.get("confidence", 0).fillna(0) * 100).round(2)
-    archive_view = archive_df[["date", "subject", "label", "confidence_pct", "gmail_labels"]].copy()
-    st.dataframe(archive_view, use_container_width=True)
-else:
-    st.info("No analyzed emails match the archive filters.")
+        def _labels_to_str(value):
+            if isinstance(value, (list, tuple)):
+                return ", ".join(str(v) for v in value)
+            return "" if value is None else str(value)
 
-# --- Summary + detailed views --------------------------------------------
-if not result_df.empty:
-    sorted_df = result_df.sort_values(by="confidence", ascending=False)
-    df_summary = build_summary_table(sorted_df)
+        archive_view["gmail_labels"] = archive_view["gmail_labels"].apply(_labels_to_str)
+        st.dataframe(archive_view, use_container_width=True)
+    else:
+        st.info("No analyzed emails match the archive filters.")
 
-    st.subheader("Email Analysis (Summary View)")
-    st.dataframe(df_summary, use_container_width=True)  # subject/label/confidence_pct/feedback only
+    # Summary + detailed views
+    if not result_df.empty:
+        sorted_df = result_df.sort_values(by="confidence", ascending=False)
+        df_summary = build_summary_table(sorted_df)
 
-    st.subheader("Detailed View")
-    for _, row in sorted_df.iterrows():
-        subject_text = row.get("subject", "(no subject)")
-        label_text = row.get("label", "")
-        with st.expander(f"{subject_text} [{label_text}]"):
-            st.write("ID:", row.get("id", ""))
-            st.write("Confidence:", row.get("confidence", ""))
-            st.write("Attachments:", row.get("attachments", ""))
-            st.write("Gmail Labels:", row.get("gmail_labels", ""))
-            st.write("Latency (ms):", row.get("latency_ms", ""))
-            st.write("Auth Results:")
-            st.json(row.get("auth_results", {}))
-            st.write("Body:")
-            st.text(row.get("body", ""))
+        st.subheader("Email Analysis (Summary View)")
+        st.dataframe(df_summary, use_container_width=True)  # subject/label/confidence_pct/feedback only
 
-    if st.checkbox("Show raw analysis data"):
-        st.dataframe(sorted_df, use_container_width=True)
+        st.subheader("Detailed View")
+        for _, row in sorted_df.iterrows():
+            subject_text = row.get("subject", "(no subject)")
+            label_text = row.get("label", "")
+            with st.expander(f"{subject_text} [{label_text}]"):
+                st.write("ID:", row.get("id", ""))
+                st.write("Confidence:", row.get("confidence", ""))
+                st.write("Attachments:", row.get("attachments", ""))
+                st.write("Gmail Labels:", row.get("gmail_labels", ""))
+                st.write("Latency (ms):", row.get("latency_ms", ""))
+                st.write("Auth Results:")
+                st.json(row.get("auth_results", {}))
+                st.write("Body:")
+                st.text(row.get("body", ""))
+
+        if st.checkbox("Show raw analysis data"):
+            st.dataframe(sorted_df, use_container_width=True)
