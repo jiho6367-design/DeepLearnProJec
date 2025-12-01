@@ -28,7 +28,13 @@ from optimized_pipeline import analyze_emails
 
 from prompt_version_tracker import PromptVersionTracker, PromptRun
 from phishing_analysis import PhishingAnalysisStore, analyze_email_content
-from history_store import init_db, save_analysis_result, load_history
+from history_store import (
+    init_db,
+    save_analysis_result,
+    load_history,
+    get_existing_gmail_ids,
+    load_history_by_gmail_ids,
+)
 
 try:
     from optimized_pipeline import classify_batch as fast_classify_batch, feedback_async as fast_feedback_async
@@ -384,27 +390,62 @@ def fetch_and_analyze():
     os.environ.setdefault("PHISHING_POLICY", DEFAULT_POLICY)
     model_outputs = analyze_emails(texts)
 
-    results = []
-    for meta, analysis in zip(emails, model_outputs):
-        now = datetime.now(timezone.utc)
-        record_id = meta.get("id") or generate_email_id(meta.get("subject", "") or "")
-        combined = {
-            **meta,
-            "id": record_id,
-            "label": analysis.get("label"),
-            "confidence": round(analysis.get("confidence", 0.0), 4),
-            "feedback": analysis.get("feedback"),
-            "latency_ms": analysis.get("latency_ms"),
-            "timestamp": now.isoformat(),
-            "date": now.date().isoformat(),
-        }
-        results.append(combined)
-        try:
-            save_analysis_result(combined)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.exception("Failed to persist analysis result: %s", exc)
+    gmail_ids = [meta.get("id") for meta in emails]
+    existing_ids = set()
+    try:
+        existing_ids = get_existing_gmail_ids([gid for gid in gmail_ids if gid])
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Failed to check existing gmail ids: %s", exc)
 
-    return jsonify({"results": results}), 200
+    cached_results: List[Dict[str, Any]] = []
+    try:
+        cached_results = load_history_by_gmail_ids(list(existing_ids))
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Failed to load cached results: %s", exc)
+        cached_results = []
+
+    to_analyze = [(meta, idx) for idx, meta in enumerate(emails) if meta.get("id") not in existing_ids]
+    analyzed_results: List[Dict[str, Any]] = []
+    if to_analyze:
+        texts_to_analyze = [_as_prompt_text(meta) for meta, _ in to_analyze]
+        try:
+            model_outputs = analyze_emails(texts_to_analyze)
+        except Exception as exc:  # pragma: no cover - fall back empty
+            logger.exception("Pipeline analysis failed: %s", exc)
+            model_outputs = []
+
+        for (meta, _), analysis in zip(to_analyze, model_outputs):
+            now = datetime.now(timezone.utc)
+            record_id = meta.get("id") or generate_email_id(meta.get("subject", "") or "")
+            combined = {
+                **meta,
+                "id": record_id,
+                "gmail_id": meta.get("id"),
+                "label": analysis.get("label"),
+                "confidence": round(analysis.get("confidence", 0.0), 4),
+                "feedback": analysis.get("feedback"),
+                "latency_ms": analysis.get("latency_ms"),
+                "timestamp": now.isoformat(),
+                "date": now.date().isoformat(),
+                "from_cache": False,
+            }
+            analyzed_results.append(combined)
+            try:
+                save_analysis_result(combined)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.exception("Failed to persist analysis result: %s", exc)
+
+    results = cached_results + analyzed_results
+    warnings: List[str] = []
+    if cached_results:
+        warnings.append(f"Reused {len(cached_results)} cached analyses.")
+    if analyzed_results:
+        warnings.append(f"Analyzed {len(analyzed_results)} new emails.")
+
+    response_body: Dict[str, Any] = {"results": results}
+    if warnings:
+        response_body["warnings"] = warnings
+    return jsonify(response_body), 200
 
 
 @app.post("/api/analyze_selected")
@@ -434,6 +475,7 @@ def analyze_selected():
         emails.append(
             {
                 "id": detail.get("id", msg_id),
+                "gmail_id": detail.get("id", msg_id),
                 "subject": detail.get("subject", ""),
                 "body": detail.get("body", ""),
                 "gmail_labels": detail.get("gmail_labels", []),
@@ -445,27 +487,51 @@ def analyze_selected():
     if not emails:
         return jsonify({"error": "no_messages_analyzed", "warnings": warnings}), 502
 
-    texts = [_as_prompt_text(email) for email in emails]
-    os.environ.setdefault("PHISHING_POLICY", DEFAULT_POLICY)
-    model_outputs = analyze_emails(texts)
+    gmail_ids = [e.get("gmail_id") for e in emails]
+    existing_ids = set()
+    try:
+        existing_ids = get_existing_gmail_ids([gid for gid in gmail_ids if gid])
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Failed to check existing gmail ids: %s", exc)
 
-    results = []
-    for meta, analysis in zip(emails, model_outputs):
-        now = datetime.now(timezone.utc)
-        combined = {
-            **meta,
-            "label": analysis.get("label"),
-            "confidence": round(analysis.get("confidence", 0.0), 4),
-            "feedback": analysis.get("feedback"),
-            "latency_ms": analysis.get("latency_ms"),
-            "timestamp": now.isoformat(),
-            "date": now.date().isoformat(),
-        }
-        results.append(combined)
-        try:
-            save_analysis_result(combined)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.exception("Failed to persist selected analysis result: %s", exc)
+    cached_results: List[Dict[str, Any]] = []
+    try:
+        cached_results = load_history_by_gmail_ids(list(existing_ids))
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Failed to load cached results: %s", exc)
+        cached_results = []
+
+    to_analyze = [email for email in emails if email.get("gmail_id") not in existing_ids]
+
+    analyzed_results: List[Dict[str, Any]] = []
+    if to_analyze:
+        texts = [_as_prompt_text(email) for email in to_analyze]
+        os.environ.setdefault("PHISHING_POLICY", DEFAULT_POLICY)
+        model_outputs = analyze_emails(texts)
+
+        for meta, analysis in zip(to_analyze, model_outputs):
+            now = datetime.now(timezone.utc)
+            combined = {
+                **meta,
+                "label": analysis.get("label"),
+                "confidence": round(analysis.get("confidence", 0.0), 4),
+                "feedback": analysis.get("feedback"),
+                "latency_ms": analysis.get("latency_ms"),
+                "timestamp": now.isoformat(),
+                "date": now.date().isoformat(),
+                "from_cache": False,
+            }
+            analyzed_results.append(combined)
+            try:
+                save_analysis_result(combined)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.exception("Failed to persist selected analysis result: %s", exc)
+
+    results = cached_results + analyzed_results
+    if cached_results:
+        warnings.append(f"Reused {len(cached_results)} cached analyses.")
+    if analyzed_results:
+        warnings.append(f"Analyzed {len(analyzed_results)} new emails.")
 
     response_body: Dict[str, Any] = {"results": results}
     if warnings:

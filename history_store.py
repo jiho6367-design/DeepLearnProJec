@@ -32,7 +32,56 @@ def init_db(db_path: Path = HISTORY_DB) -> None:
             )
             """
         )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_email_analysis_gmail_id ON email_analysis (gmail_id)"
+        )
         conn.commit()
+
+
+def get_existing_gmail_ids(gmail_ids: list[str], db_path: Path = HISTORY_DB) -> set[str]:
+    if not gmail_ids:
+        return set()
+    placeholders = ",".join(["?"] * len(gmail_ids))
+    query = f"SELECT gmail_id FROM email_analysis WHERE gmail_id IN ({placeholders})"
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(query, gmail_ids).fetchall()
+    return {row[0] for row in rows if row and row[0]}
+
+
+def load_history_by_gmail_ids(gmail_ids: list[str], db_path: Path = HISTORY_DB) -> List[Dict[str, Any]]:
+    if not gmail_ids:
+        return []
+    placeholders = ",".join(["?"] * len(gmail_ids))
+    query = f"""
+        SELECT id, subject, label, confidence, feedback, latency_ms, timestamp, date,
+               gmail_id, gmail_labels, auth_results, body
+          FROM email_analysis
+         WHERE gmail_id IN ({placeholders})
+    """
+    results: List[Dict[str, Any]] = []
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        for row in conn.execute(query, gmail_ids):
+            gmail_labels = row["gmail_labels"]
+            auth_results = row["auth_results"]
+            results.append(
+                {
+                    "id": row["id"],
+                    "subject": row["subject"],
+                    "label": row["label"],
+                    "confidence": row["confidence"],
+                    "feedback": row["feedback"],
+                    "latency_ms": row["latency_ms"],
+                    "timestamp": row["timestamp"],
+                    "date": row["date"],
+                    "gmail_id": row["gmail_id"],
+                    "gmail_labels": json.loads(gmail_labels) if gmail_labels else [],
+                    "auth_results": json.loads(auth_results) if auth_results else {},
+                    "body": row["body"],
+                    "from_cache": True,
+                }
+            )
+    return results
 
 
 def save_analysis_result(result: Dict[str, Any], db_path: Path = HISTORY_DB) -> None:
@@ -56,9 +105,20 @@ def save_analysis_result(result: Dict[str, Any], db_path: Path = HISTORY_DB) -> 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO email_analysis
+            INSERT INTO email_analysis
             (id, subject, label, confidence, feedback, latency_ms, timestamp, date, gmail_id, gmail_labels, auth_results, body)
             VALUES (:id, :subject, :label, :confidence, :feedback, :latency_ms, :timestamp, :date, :gmail_id, :gmail_labels, :auth_results, :body)
+            ON CONFLICT(gmail_id) DO UPDATE SET
+                subject=excluded.subject,
+                label=excluded.label,
+                confidence=excluded.confidence,
+                feedback=excluded.feedback,
+                latency_ms=excluded.latency_ms,
+                timestamp=excluded.timestamp,
+                date=excluded.date,
+                gmail_labels=excluded.gmail_labels,
+                auth_results=excluded.auth_results,
+                body=excluded.body
             """,
             row,
         )

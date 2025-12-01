@@ -225,7 +225,15 @@ if st.button("Fetch & Analyze Emails"):
 # --- Browse & Select Emails ----------------------------------------------
 st.subheader("Browse & Select Emails")
 select_max = st.number_input("Max emails to load", min_value=1, max_value=50, value=20, step=1)
-label_filter = st.selectbox("Label filter", ["ALL", "INBOX", "UNREAD"], index=0)
+LABEL_CHOICES = [
+    "ALL",
+    "INBOX",
+    "UNREAD",
+    "CATEGORY_PROMOTIONS",
+    "CATEGORY_UPDATES",
+    "CATEGORY_SOCIAL",
+]
+label_filter = st.selectbox("Label filter", LABEL_CHOICES, index=0)
 
 if "email_list" not in st.session_state:
     st.session_state["email_list"] = []
@@ -276,7 +284,7 @@ if st.button("Analyze Selected Emails"):
                     f"{API_BASE}/api/analyze_selected",
                     headers=headers,
                     json={"message_ids": selected_ids},
-                    timeout=60,
+                    timeout=90,
                 )
             except requests.RequestException as e:
                 st.error("API connection failed: " + str(e))
@@ -320,6 +328,43 @@ if trend_chart is not None:
     st.altair_chart(trend_chart, width="stretch")
 else:
     st.info(trend_msg)
+
+# --- Analyzed Email Archive (read-only) -----------------------------------
+st.subheader("Analyzed Email Archive")
+archive_label_filter = st.selectbox(
+    "Filter by analysis label",
+    ["ALL", "phishing", "normal"],
+    index=0,
+)
+archive_subject_query = st.text_input("Subject search (contains)")
+archive_days = st.number_input(
+    "Limit to recent N days",
+    min_value=0,
+    max_value=365,
+    value=0,
+    step=1,
+    help="0 = no limit",
+)
+
+archive_df = result_df.copy()
+if archive_label_filter != "ALL":
+    archive_df = archive_df[archive_df.get("label", "") == archive_label_filter]
+if archive_subject_query:
+    archive_df = archive_df[archive_df.get("subject", "").str.contains(archive_subject_query, case=False, na=False)]
+
+if archive_days and archive_days > 0:
+    dt_series = extract_datetime_series(archive_df)
+    if dt_series is not None:
+        cutoff = pd.Timestamp.now(tz=dt_series.dt.tz) - pd.Timedelta(days=int(archive_days))
+        archive_df = archive_df[dt_series >= cutoff]
+
+if not archive_df.empty:
+    if "confidence_pct" not in archive_df:
+        archive_df["confidence_pct"] = (archive_df.get("confidence", 0).fillna(0) * 100).round(2)
+    archive_view = archive_df[["date", "subject", "label", "confidence_pct", "gmail_labels"]].copy()
+    st.dataframe(archive_view, use_container_width=True)
+else:
+    st.info("No analyzed emails match the archive filters.")
 
 # --- Summary + detailed views --------------------------------------------
 if not result_df.empty:
