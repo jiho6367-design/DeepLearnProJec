@@ -426,8 +426,10 @@ with tab_archive:
         step=1,
         help="0 = no limit",
     )
-    start_date_str = st.text_input("Start date filter (YYYY-MM-DD, optional)", value="")
-    end_date_str = st.text_input("End date filter (YYYY-MM-DD, optional)", value="")
+    apply_start_filter = st.checkbox("Apply start date filter", value=False)
+    start_date_val = st.date_input("Start date (optional)", value=pd.to_datetime("today").date(), disabled=not apply_start_filter)
+    apply_end_filter = st.checkbox("Apply end date filter", value=False)
+    end_date_val = st.date_input("End date (optional)", value=pd.to_datetime("today").date(), disabled=not apply_end_filter)
 
     archive_df = result_df.copy()
     if archive_label_filter != "ALL":
@@ -443,13 +445,13 @@ with tab_archive:
 
     # Additional date range filter (year-month-day)
     date_series = pd.to_datetime(archive_df.get("date"), errors="coerce")
-    if start_date_str:
-        start_dt = pd.to_datetime(start_date_str, errors="coerce")
+    if apply_start_filter:
+        start_dt = pd.to_datetime(start_date_val, errors="coerce")
         if pd.notna(start_dt):
             archive_df = archive_df[date_series >= start_dt]
             date_series = date_series[date_series >= start_dt]
-    if end_date_str:
-        end_dt = pd.to_datetime(end_date_str, errors="coerce")
+    if apply_end_filter:
+        end_dt = pd.to_datetime(end_date_val, errors="coerce")
         if pd.notna(end_dt):
             archive_df = archive_df[date_series <= end_dt]
             date_series = date_series[date_series <= end_dt]
