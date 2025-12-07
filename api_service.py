@@ -49,7 +49,10 @@ MODEL_NAME = os.getenv("HF_CLASSIFIER", "distilbert-base-uncased-finetuned-sst-2
 THRESHOLD = float(os.getenv("PHISH_THRESHOLD", 0.30))
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # API 토큰이 비어 있으면 OpenAI 키를 fallback 으로 허용해 로컬 실험 시 401을 줄인다.
-API_TOKEN = (os.getenv("PHISH_API_TOKEN", "") or os.getenv("OPENAI_API_KEY", "")).strip()
+PHISH_API_TOKEN = (os.getenv("PHISH_API_TOKEN", "")).strip()
+OPENAI_API_KEY_ENV = (os.getenv("OPENAI_API_KEY", "")).strip()
+API_TOKENS: List[str] = [t for t in (PHISH_API_TOKEN, OPENAI_API_KEY_ENV) if t]
+API_TOKEN = API_TOKENS[0] if API_TOKENS else ""
 FEEDBACK_DB = Path("data/feedback.db")
 LOG_PATH = Path("logs/email_analysis.log")
 SUSPICIOUS_PATTERN = re.compile(r"(zip|exe|docm|xlsm|scr|bat)", re.IGNORECASE)
@@ -116,7 +119,7 @@ def json_abort(status: int, message: str):
 
 def require_api_token() -> Optional[str]:
     """Require API token if configured; accept X-API-Key or Authorization: Bearer."""
-    if not API_TOKEN:
+    if not API_TOKENS:
         return None
 
     header_token = (request.headers.get("X-API-Key") or "").strip()
@@ -125,8 +128,10 @@ def require_api_token() -> Optional[str]:
         bearer = bearer[7:].strip()
 
     token = header_token or bearer
-    if token != API_TOKEN:
-        print(f"[DEBUG] expected={API_TOKEN!r}, got={token!r}")
+    if token not in API_TOKENS:
+        expected_masks = [f"****{t[-4:]}" for t in API_TOKENS]
+        got_mask = f"****{token[-4:]}" if token else "<empty>"
+        print(f"[DEBUG] expected one of {expected_masks}, got={got_mask}")
         json_abort(401, "invalid_token")
     return token
 
@@ -621,7 +626,7 @@ def list_gmail_emails():
         messages = fetch_recent_messages(limit=max_results, label=label)
     except GmailAuthError as exc:
         logger.error("Gmail configuration error: %s", exc)
-        return jsonify({"error": "gmail_configuration", "detail": str(exc)}), 500
+        return jsonify({"error": "gmail_configuration", "detail": str(exc)}), 400
     except GmailClientError as exc:
         logger.error("Gmail API error while listing messages: %s", exc)
         return jsonify({"error": str(exc)}), getattr(exc, "status_code", 502)
@@ -658,7 +663,7 @@ def list_emails():
         messages = fetch_recent_messages(limit=limit)
     except GmailAuthError as exc:
         logger.error("Gmail configuration error: %s", exc)
-        return jsonify({"error": "gmail_configuration", "detail": str(exc)}), 500
+        return jsonify({"error": "gmail_configuration", "detail": str(exc)}), 400
     except GmailClientError as exc:
         logger.error("Gmail API error while listing emails: %s", exc)
         return jsonify({"error": str(exc)}), getattr(exc, "status_code", 502)
@@ -675,7 +680,7 @@ def get_email_detail(message_id: str):
         detail = fetch_message_detail(message_id)
     except GmailAuthError as exc:
         logger.error("Gmail configuration error: %s", exc)
-        return jsonify({"error": "gmail_configuration", "detail": str(exc)}), 500
+        return jsonify({"error": "gmail_configuration", "detail": str(exc)}), 400
     except GmailClientError as exc:
         logger.error("Gmail API error while fetching message %s: %s", message_id, exc)
         return jsonify({"error": str(exc)}), getattr(exc, "status_code", 502)

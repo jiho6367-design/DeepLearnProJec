@@ -5,6 +5,8 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Sequence, Dict, Any
+import re
+from urllib.parse import urlparse
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +25,67 @@ model = AutoModelForSequenceClassification.from_pretrained(
 async_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
+SUSPICIOUS_TLDS = {
+    ".xyz",
+    ".top",
+    ".icu",
+    ".vip",
+    ".click",
+    ".link",
+    ".pw",
+    ".live",
+    ".shop",
+    ".center",
+    ".work",
+    ".quest",
+}
+
+SUSPICIOUS_KEYWORDS = [
+    "otp",
+    "보안",
+    "이상거래",
+    "비정상",
+    "재등록",
+    "계좌",
+    "출금",
+    "인증",
+    "로그인",
+    "verify",
+    "secure",
+    "update",
+    "suspend",
+    "reset",
+    "urgent",
+    "auth",
+]
+
+
+def _has_suspicious_url(text: str) -> bool:
+    urls = re.findall(r"https?://[^\s)]+", text, flags=re.IGNORECASE)
+    for url in urls:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if not host:
+            continue
+        if any(host.endswith(tld) for tld in SUSPICIOUS_TLDS):
+            return True
+        if host.count("-") >= 2:
+            return True
+    return False
+
+
+def _suspicion_boost(text: str) -> float:
+    """Lightweight heuristic to boost phishing confidence for banking/OTP lures."""
+    lowered = text.lower()
+    score = 0.0
+    if _has_suspicious_url(text):
+        score += 0.35
+    for kw in SUSPICIOUS_KEYWORDS:
+        if kw in lowered:
+            score += 0.08
+    return min(score, 0.6)
+
+
 @torch.inference_mode()
 def classify_batch(texts: Sequence[str]) -> Sequence[Dict[str, Any]]:
     inputs = tokenizer(
@@ -38,11 +101,21 @@ def classify_batch(texts: Sequence[str]) -> Sequence[Dict[str, Any]]:
     for i, prob in enumerate(probs):
         idx = int(prob.argmax())
         raw = model.config.id2label[idx].upper()
+        label = "phishing" if raw.startswith("NEG") else "normal"
+        confidence = float(prob[idx])
+
+        boost = _suspicion_boost(texts[i])
+        if boost and label == "normal":
+            label = "phishing"
+            confidence = max(confidence, min(0.99, confidence + boost))
+        elif boost:
+            confidence = min(0.99, confidence + boost * 0.5)
+
         outputs.append(
             {
                 "text": texts[i],
-                "label": "phishing" if raw.startswith("NEG") else "normal",
-                "confidence": float(prob[idx]),
+                "label": label,
+                "confidence": confidence,
             }
         )
     return outputs
