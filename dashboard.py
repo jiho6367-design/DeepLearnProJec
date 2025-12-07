@@ -426,6 +426,8 @@ with tab_archive:
         step=1,
         help="0 = no limit",
     )
+    start_date_str = st.text_input("Start date filter (YYYY-MM-DD, optional)", value="")
+    end_date_str = st.text_input("End date filter (YYYY-MM-DD, optional)", value="")
 
     archive_df = result_df.copy()
     if archive_label_filter != "ALL":
@@ -438,6 +440,19 @@ with tab_archive:
         if dt_series is not None:
             cutoff = pd.Timestamp.now(tz=dt_series.dt.tz) - pd.Timedelta(days=int(archive_days))
             archive_df = archive_df[dt_series >= cutoff]
+
+    # Additional date range filter (year-month-day)
+    date_series = pd.to_datetime(archive_df.get("date"), errors="coerce")
+    if start_date_str:
+        start_dt = pd.to_datetime(start_date_str, errors="coerce")
+        if pd.notna(start_dt):
+            archive_df = archive_df[date_series >= start_dt]
+            date_series = date_series[date_series >= start_dt]
+    if end_date_str:
+        end_dt = pd.to_datetime(end_date_str, errors="coerce")
+        if pd.notna(end_dt):
+            archive_df = archive_df[date_series <= end_dt]
+            date_series = date_series[date_series <= end_dt]
 
     if not archive_df.empty:
         df = archive_df.copy()
