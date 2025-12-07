@@ -2,6 +2,7 @@ import json
 import os
 import math
 import time
+import re
 
 import altair as alt
 import pandas as pd
@@ -216,6 +217,40 @@ def build_summary_table(df: pd.DataFrame):
     return summary_base.reindex(columns=["subject", "label", "confidence_pct", "feedback"])
 
 
+# Body cleaning helper for archive body view
+HEADER_PREFIX = re.compile(r"^(from|to|cc|bcc|date|received|subject|mime-|content-|return-path):", re.IGNORECASE)
+URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+FOOTER_KEYWORDS = ["confidential", "본 메일", "수신거부", "unsubscribe", "tracking id", "이 메일", "면책"]
+
+
+def extract_display_body(raw_body: str) -> str:
+    """
+    Return only the meaningful email body:
+    - strip headers and MIME noise
+    - remove/replace URLs
+    - drop boilerplate footers
+    - strip HTML tags/CSS
+    """
+    if not raw_body:
+        return ""
+    lines = []
+    for line in str(raw_body).splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if HEADER_PREFIX.match(s):
+            continue
+        low = s.lower()
+        if any(key in low for key in FOOTER_KEYWORDS):
+            continue
+        lines.append(s)
+    text = " ".join(lines)
+    text = URL_PATTERN.sub("[link]", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 # --- Upload single email --------------------------------------------------
 # --- Tabs layout ----------------------------------------------------------
 tab_analyze, tab_archive = st.tabs(["Analyze Emails", "Analysis Archive"])
@@ -405,10 +440,41 @@ with tab_archive:
             archive_df = archive_df[dt_series >= cutoff]
 
     if not archive_df.empty:
-        archive_df = archive_df.copy()
-        archive_df["confidence_pct"] = (archive_df.get("confidence", 0).fillna(0) * 100).round(2)
-        unified_cols = ["date", "subject", "label", "confidence_pct", "feedback"]
-        unified_df = archive_df.reindex(columns=unified_cols)
-        st.dataframe(unified_df, use_container_width=True)
+        df = archive_df.copy()
+        df["confidence_pct"] = (df.get("confidence", 0).fillna(0).astype(float) * 100).round(2)
+        df["display_body"] = df.apply(
+            lambda r: extract_display_body(r.get("body") or r.get("raw_body") or ""),
+            axis=1,
+        )
+
+        table_view = df[["date", "subject", "label", "confidence_pct", "feedback"]].copy()
+        table_view["confidence_pct"] = table_view["confidence_pct"].map(lambda v: f"{v:.2f}%")
+
+        st.dataframe(table_view, use_container_width=True, height=400)
+
+        options = list(df.index)
+        labels = [
+            f"{df.loc[i, 'date']} | {df.loc[i, 'subject'] or '(no subject)'}"
+            for i in options
+        ]
+        if "archive_selected_idx" not in st.session_state:
+            st.session_state["archive_selected_idx"] = options[0] if options else None
+
+        selected_idx = st.selectbox(
+            "Select an email to view body",
+            options=options,
+            format_func=lambda i: labels[options.index(i)] if options else "",
+            index=options.index(st.session_state["archive_selected_idx"]) if options and st.session_state["archive_selected_idx"] in options else 0,
+            key="archive_select",
+        ) if options else None
+
+        if selected_idx is not None:
+            st.session_state["archive_selected_idx"] = selected_idx
+            subject = df.loc[selected_idx, "subject"] or "(no subject)"
+            body_text = df.loc[selected_idx, "display_body"]
+            st.markdown(f"### Email body — {subject}")
+            st.text(body_text if body_text else "No body text available for this email.")
+        else:
+            st.caption("Click an email to see the body.")
     else:
         st.info("No analyzed emails match the archive filters.")
