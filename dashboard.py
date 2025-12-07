@@ -364,10 +364,9 @@ with tab_archive:
     if metric_avg_latency is None or (isinstance(metric_avg_latency, float) and math.isnan(metric_avg_latency)):
         metric_avg_latency = 0.0
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     col1.metric("Phishing Detected (Today)", metric_phishing_today)
-    col2.metric("False Positives (Today)", metric_false_positive)
-    col3.metric("Avg GPT Latency (ms)", round(metric_avg_latency, 1))
+    col2.metric("Avg GPT Latency (ms)", round(metric_avg_latency, 1))
 
     # Trend chart (multi-line)
     trend_chart, trend_msg = build_trend_chart(result_df)
@@ -410,7 +409,6 @@ with tab_archive:
         archive_df["confidence_pct"] = (archive_df.get("confidence", 0).fillna(0) * 100).round(2)
         unified_cols = ["date", "subject", "label", "confidence_pct", "feedback"]
         unified_df = archive_df.reindex(columns=unified_cols)
-        unified_df.insert(0, "no", range(1, len(unified_df) + 1))
         st.dataframe(unified_df, use_container_width=True)
     else:
         st.info("No analyzed emails match the archive filters.")
