@@ -376,7 +376,7 @@ with tab_archive:
     else:
         st.info(trend_msg)
 
-    # Analyzed Email Archive (read-only)
+    # Analyzed Email Archive (single unified table)
     st.subheader("Analyzed Email Archive")
     archive_label_filter = st.selectbox(
         "Filter by analysis label",
@@ -406,42 +406,11 @@ with tab_archive:
             archive_df = archive_df[dt_series >= cutoff]
 
     if not archive_df.empty:
-        if "confidence_pct" not in archive_df:
-            archive_df["confidence_pct"] = (archive_df.get("confidence", 0).fillna(0) * 100).round(2)
-        archive_view = archive_df[["date", "subject", "label", "confidence_pct", "gmail_labels"]].copy()
-
-        def _labels_to_str(value):
-            if isinstance(value, (list, tuple)):
-                return ", ".join(str(v) for v in value)
-            return "" if value is None else str(value)
-
-        archive_view["gmail_labels"] = archive_view["gmail_labels"].apply(_labels_to_str)
-        st.dataframe(archive_view, use_container_width=True)
+        archive_df = archive_df.copy()
+        archive_df["confidence_pct"] = (archive_df.get("confidence", 0).fillna(0) * 100).round(2)
+        unified_cols = ["date", "subject", "label", "confidence_pct", "feedback"]
+        unified_df = archive_df.reindex(columns=unified_cols)
+        unified_df.insert(0, "no", range(1, len(unified_df) + 1))
+        st.dataframe(unified_df, use_container_width=True)
     else:
         st.info("No analyzed emails match the archive filters.")
-
-    # Summary + detailed views
-    if not result_df.empty:
-        sorted_df = result_df.sort_values(by="confidence", ascending=False)
-        df_summary = build_summary_table(sorted_df)
-
-        st.subheader("Email Analysis (Summary View)")
-        st.dataframe(df_summary, use_container_width=True)  # subject/label/confidence_pct/feedback only
-
-        st.subheader("Detailed View")
-        for _, row in sorted_df.iterrows():
-            subject_text = row.get("subject", "(no subject)")
-            label_text = row.get("label", "")
-            with st.expander(f"{subject_text} [{label_text}]"):
-                st.write("ID:", row.get("id", ""))
-                st.write("Confidence:", row.get("confidence", ""))
-                st.write("Attachments:", row.get("attachments", ""))
-                st.write("Gmail Labels:", row.get("gmail_labels", ""))
-                st.write("Latency (ms):", row.get("latency_ms", ""))
-                st.write("Auth Results:")
-                st.json(row.get("auth_results", {}))
-                st.write("Body:")
-                st.text(row.get("body", ""))
-
-        if st.checkbox("Show raw analysis data"):
-            st.dataframe(sorted_df, use_container_width=True)
