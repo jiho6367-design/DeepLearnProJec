@@ -256,26 +256,54 @@ def analyze():
 
     token = require_api_token()
 
-    text = "\n".join(part for part in (title, body) if part)
-    label, confidence = classify_email(text)
+    email_meta = {
+        "subject": title,
+        "body": body,
+        "gmail_labels": [],
+        "auth_results": {},
+        "attachments": [],
+    }
+    os.environ.setdefault("PHISHING_POLICY", DEFAULT_POLICY)
+    analysis_list = analyze_emails([_as_prompt_text(email_meta)])
+    analysis = analysis_list[0] if analysis_list else {}
+
     email_id = generate_email_id(title + body)
-    feedback, latency_ms = build_feedback(text, label, confidence, email_id)
-    result = serialize_result(label, confidence, feedback)
-    # Persist analysis result (response shape unchanged)
+    now = datetime.now(timezone.utc)
     combined_for_db = {
-        **result,
         "id": email_id,
         "subject": title,
         "body": body,
         "gmail_labels": [],
         "auth_results": {},
-        "latency_ms": latency_ms,
+        "label": analysis.get("label"),
+        "confidence": round(analysis.get("confidence", 0.0), 4),
+        "feedback": analysis.get("feedback"),
+        "latency_ms": analysis.get("latency_ms"),
+        "timestamp": now.isoformat(),
+        "date": now.date().isoformat(),
+        "gmail_id": email_id,
     }
     try:
         save_analysis_result(combined_for_db)
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.exception("Failed to persist analysis result: %s", exc)
-    return jsonify(result), 200
+    return (
+        jsonify(
+            {
+                "label": combined_for_db["label"],
+                "confidence": combined_for_db["confidence"],
+                "needs_human_review": (
+                    combined_for_db["label"] == "phishing"
+                    and combined_for_db["confidence"] >= THRESHOLD
+                ),
+                "threshold": THRESHOLD,
+                "gpt_feedback": combined_for_db["feedback"],
+                "timestamp": combined_for_db["timestamp"],
+                "date": combined_for_db["date"],
+            }
+        ),
+        200,
+    )
 
 
 @app.post("/api/analyze_batch")
