@@ -418,14 +418,6 @@ with tab_archive:
         index=0,
     )
     archive_subject_query = st.text_input("Subject search (contains)")
-    archive_days = st.number_input(
-        "Limit to recent N days",
-        min_value=0,
-        max_value=365,
-        value=0,
-        step=1,
-        help="0 = no limit",
-    )
     apply_start_filter = st.checkbox("Apply start date filter", value=False)
     start_date_val = st.date_input("Start date (optional)", value=pd.to_datetime("today").date(), disabled=not apply_start_filter)
     apply_end_filter = st.checkbox("Apply end date filter", value=False)
@@ -436,12 +428,6 @@ with tab_archive:
         archive_df = archive_df[archive_df.get("label", "") == archive_label_filter]
     if archive_subject_query:
         archive_df = archive_df[archive_df.get("subject", "").str.contains(archive_subject_query, case=False, na=False)]
-
-    if archive_days and archive_days > 0:
-        dt_series = extract_datetime_series(archive_df)
-        if dt_series is not None:
-            cutoff = pd.Timestamp.now(tz=dt_series.dt.tz) - pd.Timedelta(days=int(archive_days))
-            archive_df = archive_df[dt_series >= cutoff]
 
     # Additional date range filter (year-month-day)
     date_series = pd.to_datetime(archive_df.get("date"), errors="coerce")
