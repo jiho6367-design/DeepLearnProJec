@@ -75,15 +75,21 @@ def _has_suspicious_url(text: str) -> bool:
 
 
 def _suspicion_boost(text: str) -> float:
-    """Lightweight heuristic to boost phishing confidence for banking/OTP lures."""
+    """Lightweight heuristic to boost phishing confidence for banking/OTP lures.
+
+    To reduce false positives, we only boost when BOTH a suspicious URL is present
+    AND multiple keyword cues appear. Otherwise return a tiny/no boost.
+    """
     lowered = text.lower()
-    score = 0.0
-    if _has_suspicious_url(text):
-        score += 0.35
-    for kw in SUSPICIOUS_KEYWORDS:
-        if kw in lowered:
-            score += 0.08
-    return min(score, 0.6)
+    url_flag = _has_suspicious_url(text)
+    hits = sum(1 for kw in SUSPICIOUS_KEYWORDS if kw in lowered)
+
+    if url_flag and hits >= 2:
+        # Strong signal: keep modest boost to avoid over-flipping benign mails
+        return 0.25 + min(0.05 * hits, 0.25)  # cap at 0.5
+    if url_flag and hits == 1:
+        return 0.1
+    return 0.0
 
 
 @torch.inference_mode()
@@ -106,7 +112,9 @@ def classify_batch(texts: Sequence[str]) -> Sequence[Dict[str, Any]]:
 
         boost = _suspicion_boost(texts[i])
         if boost and label == "normal":
-            label = "phishing"
+            # Only flip to phishing if original confidence is low and boost is strong enough
+            if confidence < 0.65 and boost >= 0.25:
+                label = "phishing"
             confidence = max(confidence, min(0.99, confidence + boost))
         elif boost:
             confidence = min(0.99, confidence + boost * 0.5)
