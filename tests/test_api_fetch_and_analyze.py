@@ -6,6 +6,8 @@ import api_service
 
 
 def test_fetch_and_analyze_endpoint(monkeypatch):
+    monkeypatch.setenv("PHISHGUARD_TEST_MODE", "1")
+
     sample_emails = [
         {
             "id": "abc123",

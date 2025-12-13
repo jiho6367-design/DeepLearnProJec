@@ -3,6 +3,7 @@ import os
 import math
 import time
 import re
+import html
 
 import altair as alt
 import pandas as pd
@@ -227,14 +228,23 @@ def extract_display_body(raw_body: str) -> str:
     """
     Return only the meaningful email body:
     - strip headers and MIME noise
+    - remove script/style/html tags and decode entities
     - remove/replace URLs
     - drop boilerplate footers
-    - strip HTML tags/CSS
+    - return plain natural-language text
     """
     if not raw_body:
         return ""
+    text = str(raw_body)
+
+    # Drop script/style blocks before removing tags
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\\1>", " ", text)
+    text = html.unescape(text)
+    # Remove remaining HTML tags
+    text = re.sub(r"<[^>]+>", " ", text)
+
     lines = []
-    for line in str(raw_body).splitlines():
+    for line in text.splitlines():
         s = line.strip()
         if not s:
             continue
@@ -246,7 +256,6 @@ def extract_display_body(raw_body: str) -> str:
         lines.append(s)
     text = " ".join(lines)
     text = URL_PATTERN.sub("[link]", text)
-    text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
