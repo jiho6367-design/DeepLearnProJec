@@ -40,7 +40,7 @@ load_dotenv(".env")
 os.environ.setdefault("PYTHONUTF8", "1")
 
 MODEL_NAME = os.getenv("HF_CLASSIFIER", "distilbert-base-uncased-finetuned-sst-2-english")
-THRESHOLD = float(os.getenv("PHISH_THRESHOLD", 0.30))
+THRESHOLD = float(os.getenv("PHISH_THRESHOLD", 0.25))
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # API 토큰이 비어 있으면 OpenAI 키를 fallback 으로 허용해 로컬 실험 시 401을 줄인다.
 PHISH_API_TOKEN = (os.getenv("PHISH_API_TOKEN", "")).strip()

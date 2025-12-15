@@ -14,7 +14,7 @@ from scoring import compute_rule_score, fuse_scores, decide_label, clamp_confide
 
 # Lightweight fusion of a fast HuggingFace classifier + rule-based signals.
 FAST_MODEL = os.getenv("FAST_MODEL", "philschmid/MiniLM-L6-H384-uncased-sst2")
-PHISH_THRESHOLD = float(os.getenv("PHISH_THRESHOLD", "0.30"))
+PHISH_THRESHOLD = float(os.getenv("PHISH_THRESHOLD", "0.25"))
 # Relative weight of the model vs. rules for fusion; can be tuned offline.
 MODEL_WEIGHT = float(os.getenv("MODEL_WEIGHT", "0.7"))
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
