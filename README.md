@@ -28,6 +28,13 @@
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `OPENAI_API_KEY`를 환경 변수로 설정합니다.
 - `python ingestion_workflow.py`를 실행하면 읽지 않은 메일을 가져와 SPF/DKIM/DMARC, Gmail 라벨 신호와 함께 분류/피드백을 출력합니다. 기본 정책 문구는 `PHISHING_POLICY` 환경 변수로 교체 가능합니다.
 
+## 평가·라벨링·임계값 운영 가이드
+- 샘플 수집: Gmail API로 최근/의심 메일을 CSV(`text` 또는 `subject`/`body`, `label`)로 덤프합니다. 내부 피싱 훈련 메일·스팸함·정상 업무 메일을 균형 있게 포함시킵니다.
+- 라벨링 기준: `label`은 `phishing`/`normal`(또는 1/0). 멀웨어 첨부, 브랜드 스푸핑, 계정탈취/결제 요청은 `phishing`; 뉴스레터·시스템 알림 등 정상 서비스 발신은 `normal`.
+- 오프라인 평가: `python eval.py samples.csv --sweep` 로 precision/recall/F1과 임계값 스윕을 출력합니다. 네트워크 없이 HuggingFace 캐시 + 룰 기반 점수만 사용합니다(피드백 LLM 호출 없음).
+- 임계값 결정: `PHISH_THRESHOLD`(기본 0.30)을 조정합니다. 보수적 운영(오탐 최소) 시 0.5~0.6, 공격 탐지 우선(미탐 최소) 시 0.25~0.35를 권장합니다. 결정 후 동일 샘플셋으로 재측정하여 변화폭을 기록합니다.
+- 회귀 테스트: 동일 CSV를 저장소에 보관하고 CI에서 `eval.py`를 돌려 precision/recall/F1이 감소하면 경고하도록 설정합니다.
+
 ## .env 배치 경로와 사용법
 - **위치**: 리포지토리 루트(`/workspace/DeepLearnProJec/.env`)에 `.env` 파일을 두면 됩니다. (이미 `.gitignore`에 추가되어 있으므로 커밋되지 않습니다.)
 - **샘플 파일**: `.env.example`에 실제로 사용 가능한 샘플 값이 포함되어 있으니, `cp .env.example .env` 후 필요 시 값을 교체해 사용하세요.
@@ -42,4 +49,3 @@
   GMAIL_USER=your_gmail_address
   ```
 - **적용 방법**: 쉘에서 `set -a; source .env; set +a`로 한번 로드하면 이후 터미널 세션에서 환경 변수가 잡힌 상태로 `python ingestion_workflow.py` 등 명령을 실행할 수 있습니다.
-

@@ -60,7 +60,7 @@ def fetch_and_analyze_unread(max_results: int = 5) -> List[Dict[str, Any]]:
 
     texts = [_as_prompt_text(email) for email in emails]
     os.environ.setdefault("PHISHING_POLICY", DEFAULT_POLICY)
-    model_outputs = analyze_emails(texts)
+    model_outputs = analyze_emails(texts, metas=emails)
 
     combined: List[Dict[str, Any]] = []
     for meta, analysis in zip(emails, model_outputs):

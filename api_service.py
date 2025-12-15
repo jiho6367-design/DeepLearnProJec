@@ -36,12 +36,6 @@ from history_store import (
     load_history_by_gmail_ids,
 )
 
-try:
-    from optimized_pipeline import classify_batch as fast_classify_batch, feedback_async as fast_feedback_async
-except Exception:
-    fast_classify_batch = None
-    fast_feedback_async = None
-
 load_dotenv(".env")
 os.environ.setdefault("PYTHONUTF8", "1")
 
@@ -269,7 +263,7 @@ def analyze():
         "attachments": [],
     }
     os.environ.setdefault("PHISHING_POLICY", DEFAULT_POLICY)
-    analysis_list = analyze_emails([_as_prompt_text(email_meta)])
+    analysis_list = analyze_emails([_as_prompt_text(email_meta)], metas=[email_meta])
     analysis = analysis_list[0] if analysis_list else {}
 
     email_id = generate_email_id(title + body)
@@ -342,29 +336,31 @@ def analyze_batch():
 
     results: List[Optional[Dict[str, Any]]] = [None] * len(items)
 
-    use_fast = fast_classify_batch is not None and fast_feedback_async is not None
-    if use_fast:
-        try:
-            texts = [entry["text"] for entry in prepared]
-            classifications = fast_classify_batch(texts)
-            feedbacks = asyncio_run_feedback(classifications)
-            for entry, cls, fb in zip(prepared, classifications, feedbacks):
-                needs_review = cls["label"] == "phishing" and cls["confidence"] >= THRESHOLD
-                log_prompt_run(entry["email_id"], cls["label"], fb["latency_ms"])
-                results[entry["index"]] = {
-                    "id": entry["email_id"],
-                    "label": cls["label"],
-                    "confidence": round(cls["confidence"], 4),
-                    "needs_human_review": needs_review,
-                    "threshold": THRESHOLD,
-                    "gpt_feedback": fb["content"],
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "date": datetime.now(timezone.utc).date().isoformat(),
-                }
-        except Exception:
-            use_fast = False
+    try:
+        analyses = analyze_emails([entry["text"] for entry in prepared])
+    except Exception as exc:
+        logger.error("Batch analysis failed: %s", exc)
+        analyses = []
 
-    if not use_fast:
+    if analyses:
+        for entry, analysis in zip(prepared, analyses):
+            needs_review = analysis.get("label") == "phishing" and analysis.get("confidence", 0.0) >= THRESHOLD
+            results[entry["index"]] = {
+                "id": entry["email_id"],
+                "label": analysis.get("label"),
+                "confidence": round(analysis.get("confidence", 0.0), 4),
+                "needs_human_review": needs_review,
+                "threshold": THRESHOLD,
+                "gpt_feedback": analysis.get("feedback"),
+                "latency_ms": analysis.get("latency_ms"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "date": datetime.now(timezone.utc).date().isoformat(),
+                "rule_score": analysis.get("rule_score"),
+                "base_label": analysis.get("base_label"),
+                "base_confidence": analysis.get("base_confidence"),
+            }
+
+    if not analyses:
         for entry in prepared:
             label, confidence = classify_email(entry["text"])
             feedback, latency_ms = build_feedback(entry["text"], label, confidence, entry["email_id"])
@@ -387,12 +383,6 @@ def analyze_batch():
             logger.exception("Failed to persist batch analysis result: %s", exc)
 
     return jsonify({"results": results}), 200
-
-
-def asyncio_run_feedback(classifications: List[Dict[str, Any]]):
-    if fast_feedback_async is None:
-        raise RuntimeError("optimized pipeline unavailable")
-    return asyncio.run(fast_feedback_async(classifications))
 
 
 @app.post("/api/fetch_and_analyze")
@@ -421,7 +411,7 @@ def fetch_and_analyze():
 
     texts = [_as_prompt_text(email) for email in emails]
     os.environ.setdefault("PHISHING_POLICY", DEFAULT_POLICY)
-    model_outputs = analyze_emails(texts)
+    model_outputs = analyze_emails(texts, metas=emails)
 
     gmail_ids = [meta.get("id") for meta in emails]
     existing_ids = set()
@@ -442,7 +432,7 @@ def fetch_and_analyze():
     if to_analyze:
         texts_to_analyze = [_as_prompt_text(meta) for meta, _ in to_analyze]
         try:
-            model_outputs = analyze_emails(texts_to_analyze)
+            model_outputs = analyze_emails(texts_to_analyze, metas=[meta for meta, _ in to_analyze])
         except Exception as exc:  # pragma: no cover - fall back empty
             logger.exception("Pipeline analysis failed: %s", exc)
             model_outputs = []
@@ -540,7 +530,7 @@ def analyze_selected():
     if to_analyze:
         texts = [_as_prompt_text(email) for email in to_analyze]
         os.environ.setdefault("PHISHING_POLICY", DEFAULT_POLICY)
-        model_outputs = analyze_emails(texts)
+        model_outputs = analyze_emails(texts, metas=to_analyze)
 
         for meta, analysis in zip(to_analyze, model_outputs):
             now = datetime.now(timezone.utc)

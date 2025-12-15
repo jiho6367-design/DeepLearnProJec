@@ -3,17 +3,20 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Sequence, Dict, Any
-import re
-from urllib.parse import urlparse
+from typing import Sequence, Dict, Any, List
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from openai import AsyncOpenAI
 
+from scoring import compute_rule_score, fuse_scores, decide_label, clamp_confidence
+
+# Lightweight fusion of a fast HuggingFace classifier + rule-based signals.
 FAST_MODEL = os.getenv("FAST_MODEL", "philschmid/MiniLM-L6-H384-uncased-sst2")
+PHISH_THRESHOLD = float(os.getenv("PHISH_THRESHOLD", "0.30"))
+# Relative weight of the model vs. rules for fusion; can be tuned offline.
+MODEL_WEIGHT = float(os.getenv("MODEL_WEIGHT", "0.7"))
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 tokenizer = AutoTokenizer.from_pretrained(FAST_MODEL, use_fast=True)
@@ -25,71 +28,8 @@ model = AutoModelForSequenceClassification.from_pretrained(
 async_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
-SUSPICIOUS_TLDS = {
-    ".xyz",
-    ".top",
-    ".icu",
-    ".vip",
-    ".click",
-    ".link",
-    ".pw",
-    ".live",
-    ".shop",
-    ".center",
-    ".work",
-    ".quest",
-}
-
-SUSPICIOUS_KEYWORDS = [
-    "otp",
-    "보안",
-    "이상거래",
-    "비정상",
-    "재등록",
-    "계좌",
-    "출금",
-    "인증",
-    "로그인",
-    "verify",
-    "secure",
-    "update",
-    "suspend",
-    "reset",
-    "urgent",
-    "auth",
-]
-
-
-def _has_suspicious_url(text: str) -> bool:
-    urls = re.findall(r"https?://[^\s)]+", text, flags=re.IGNORECASE)
-    for url in urls:
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
-        if not host:
-            continue
-        if any(host.endswith(tld) for tld in SUSPICIOUS_TLDS):
-            return True
-        if host.count("-") >= 2:
-            return True
-    return False
-
-
-def _suspicion_boost(text: str) -> float:
-    """Lightweight heuristic to boost phishing confidence for banking/OTP lures.
-
-    To reduce false positives, we only boost when BOTH a suspicious URL is present
-    AND multiple keyword cues appear. Otherwise return a tiny/no boost.
-    """
-    lowered = text.lower()
-    url_flag = _has_suspicious_url(text)
-    hits = sum(1 for kw in SUSPICIOUS_KEYWORDS if kw in lowered)
-
-    if url_flag and hits >= 2:
-        # Strong signal: keep modest boost to avoid over-flipping benign mails
-        return 0.25 + min(0.05 * hits, 0.25)  # cap at 0.5
-    if url_flag and hits == 1:
-        return 0.1
-    return 0.0
+def _infer_label_mapping() -> Dict[int, str]:
+    return {idx: str(lbl).upper() for idx, lbl in model.config.id2label.items()}
 
 
 @torch.inference_mode()
@@ -103,38 +43,30 @@ def classify_batch(texts: Sequence[str]) -> Sequence[Dict[str, Any]]:
     ).to(DEVICE)
     logits = model(**inputs).logits
     probs = F.softmax(logits, dim=-1)
+
+    id2label = _infer_label_mapping()
+    phish_idx = next((i for i, lbl in id2label.items() if "NEG" in lbl or "PHISH" in lbl), None)
+
     outputs = []
     for i, prob in enumerate(probs):
         idx = int(prob.argmax())
-        raw = model.config.id2label[idx].upper()
-        label = "phishing" if raw.startswith("NEG") else "normal"
-        confidence = float(prob[idx])
-
-        boost = _suspicion_boost(texts[i])
-        if boost and label == "normal":
-            # Only flip to phishing if original confidence is low and boost is strong enough
-            if confidence < 0.65 and boost >= 0.25:
-                label = "phishing"
-            confidence = max(confidence, min(0.99, confidence + boost))
-        elif boost:
-            confidence = min(0.99, confidence + boost * 0.5)
-
+        raw = id2label.get(idx, "")
+        base_label = "phishing" if raw.startswith("NEG") or "PHISH" in raw else "normal"
+        base_conf = clamp_confidence(float(prob[idx]))
+        phish_prob = (
+            clamp_confidence(float(prob[phish_idx]))
+            if phish_idx is not None
+            else (base_conf if base_label == "phishing" else 1.0 - base_conf)
+        )
         outputs.append(
             {
                 "text": texts[i],
-                "label": label,
-                "confidence": confidence,
+                "base_label": base_label,
+                "base_confidence": base_conf,
+                "phish_probability": phish_prob,
             }
         )
     return outputs
-
-
-def analyze_in_threads(texts: Sequence[str], batch_size: int = 64) -> Sequence[Dict[str, Any]]:
-    batches = [texts[i : i + batch_size] for i in range(0, len(texts), batch_size)]
-    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
-        results = pool.map(classify_batch, batches)
-    flattened = [item for batch in results for item in batch]
-    return flattened
 
 
 async def feedback_async(
@@ -150,7 +82,7 @@ Email:
 Verdict: {item['label']} ({item['confidence']:.2%})
 
 Explain briefly why/why not it is risky, cite the policy items you used, and give three safe actions.
-모든 설명과 피드백 문장은 한국어로 작성하세요."""
+모든 설명과 메세지는 한국어로 작성하세요"""
         started = time.perf_counter()
         resp = await async_client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -159,7 +91,7 @@ Explain briefly why/why not it is risky, cite the policy items you used, and giv
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a concise cybersecurity analyst. 모든 설명과 피드백은 한국어로 작성하세요.",
+                    "content": "You are a concise cybersecurity analyst. 모든 설명과 메세지는 한국어로 작성하세요",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -174,8 +106,9 @@ Explain briefly why/why not it is risky, cite the policy items you used, and giv
     return responses
 
 
-def analyze_emails(texts: Sequence[str]) -> Sequence[Dict[str, Any]]:
-    batches = analyze_in_threads(texts)
+def analyze_emails(texts: Sequence[str], metas: Sequence[Dict[str, Any]] | None = None) -> Sequence[Dict[str, Any]]:
+    metas = metas or [{} for _ in texts]
+    base_results = classify_batch(texts)
     detection_policy = os.getenv(
         "PHISHING_POLICY",
         (
@@ -183,8 +116,27 @@ def analyze_emails(texts: Sequence[str]) -> Sequence[Dict[str, Any]]:
             "unexpected attachments, sender mismatch, and urgent/social-engineering language."
         ),
     )
-    feedback = asyncio.run(feedback_async(batches, detection_policy=detection_policy))
-    for record, fb in zip(batches, feedback):
+
+    fused_records: List[Dict[str, Any]] = []
+    for base, meta in zip(base_results, metas):
+        rule_score, signals = compute_rule_score(base["text"], meta)
+        fused = fuse_scores(base["phish_probability"], rule_score, model_weight=MODEL_WEIGHT)
+        label = decide_label(fused, threshold=PHISH_THRESHOLD)
+        fused_records.append(
+            {
+                "text": base["text"],
+                "label": label,
+                "confidence": clamp_confidence(fused),
+                "rule_score": clamp_confidence(rule_score),
+                "rule_signals": [sig.reason for sig in signals],
+                "base_label": base["base_label"],
+                "base_confidence": base["base_confidence"],
+                "base_phish_probability": base["phish_probability"],
+            }
+        )
+
+    feedback = asyncio.run(feedback_async(fused_records, detection_policy=detection_policy))
+    for record, fb in zip(fused_records, feedback):
         record["feedback"] = fb["content"]
         record["latency_ms"] = fb["latency_ms"]
-    return batches
+    return fused_records
