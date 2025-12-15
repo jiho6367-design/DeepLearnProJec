@@ -63,7 +63,7 @@ class RuleSignal:
     reason: str
 
 
-URL_REGEX = re.compile(r"(?:(?:https?://)|(?:www\\.))[^\s)]+", flags=re.IGNORECASE)
+URL_REGEX = re.compile(r"(?:(?:https?://)|(?:www.))[^\s)]+", flags=re.IGNORECASE)
 
 
 def _extract_urls(text: str) -> List[str]:

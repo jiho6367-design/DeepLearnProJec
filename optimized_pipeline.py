@@ -138,7 +138,20 @@ def analyze_emails(texts: Sequence[str], metas: Sequence[Dict[str, Any]] | None 
             }
         )
 
-    feedback = asyncio.run(feedback_async(fused_records, detection_policy=detection_policy))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is None:
+        feedback = asyncio.run(feedback_async(fused_records, detection_policy=detection_policy))
+    else:
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, feedback_async(fused_records, detection_policy=detection_policy))
+            feedback = future.result()
+
     for record, fb in zip(fused_records, feedback):
         record["feedback"] = fb["content"]
         record["latency_ms"] = fb["latency_ms"]

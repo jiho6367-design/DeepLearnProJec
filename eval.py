@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 from typing import Any, Dict, List, Tuple
 
 from optimized_pipeline import classify_batch, PHISH_THRESHOLD, MODEL_WEIGHT
@@ -38,7 +39,7 @@ def _extract_meta(row: Dict[str, Any]) -> Dict[str, Any]:
         meta["auth_results"] = auth
     if "attachments" in row and row["attachments"]:
         att_list = []
-        for token in str(row["attachments"]).split(","):
+        for token in re.split(r"[;,]", str(row["attachments"])):
             token = token.strip()
             if not token:
                 continue
