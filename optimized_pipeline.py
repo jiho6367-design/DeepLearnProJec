@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from typing import Sequence, Dict, Any, List
@@ -69,6 +70,72 @@ def classify_batch(texts: Sequence[str]) -> Sequence[Dict[str, Any]]:
     return outputs
 
 
+def _run_coro_allow_nested(coro):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is None:
+        return asyncio.run(coro)
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, coro)
+        return future.result()
+
+
+def final_judge_with_llm(email_text: str, base_prob: float, rule_score: float, rule_signals: List[str]) -> Dict[str, Any] | None:
+    if not os.environ.get("OPENAI_API_KEY"):
+        return None
+
+    signals = ", ".join(rule_signals) if rule_signals else "none"
+    prompt = f"""You are the final phishing decision engine. Return JSON only.
+Inputs:
+- Model phishing probability: {base_prob:.3f}
+- Rule-based risk score: {rule_score:.3f}
+- Detected signals: {signals}
+- Email text:
+{email_text}
+
+Rules:
+- Be conservative with financial notifications.
+- Do NOT flag invoices or receipts without links or actions (treat those as normal unless other strong evidence).
+
+Respond ONLY with JSON in this schema:
+{{"label": "phishing|normal", "confidence": 0-100, "brief_reason": "..."}}"""
+
+    async def _call():
+        resp = await async_client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "You are a decisive phishing detector. Output JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.choices[0].message.content or "{}"
+        return json.loads(content)
+
+    try:
+        result = _run_coro_allow_nested(_call())
+    except Exception:
+        return None
+
+    try:
+        label = str(result.get("label", "")).strip().lower()
+        if label not in {"phishing", "normal"}:
+            return None
+        conf_raw = float(result.get("confidence", 0.0))
+        conf_pct = max(0.0, min(100.0, conf_raw))
+        reason = str(result.get("brief_reason", "")).strip()
+        return {"label": label, "confidence_pct": conf_pct, "brief_reason": reason}
+    except Exception:
+        return None
+
+
 async def feedback_async(
     items: Sequence[Dict[str, Any]], detection_policy: str = ""
 ) -> Sequence[Dict[str, Any]]:
@@ -84,30 +151,22 @@ Email:
 
 Verdict: {item['label']} ({item['confidence']:.2%})
 
-Explain briefly why/why not it is risky, cite the policy items you used, and give three safe actions.
-모든 설명과 메세지는 한국어로 작성하세요"""
+Explain briefly why/why not it is risky, cite the policy items you used, and give three safe actions. Respond in Korean."""
         started = time.perf_counter()
         resp = await async_client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             temperature=0.2,
             max_tokens=320,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a concise cybersecurity analyst. 모든 설명과 메세지는 한국어로 작성하세요",
-                },
+                {"role": "system", "content": "You are a concise cybersecurity analyst. Respond in Korean."},
                 {"role": "user", "content": prompt},
             ],
         )
         latency_ms = (time.perf_counter() - started) * 1000
-        return {
-            "content": resp.choices[0].message.content.strip(),
-            "latency_ms": latency_ms,
-        }
+        return {"content": resp.choices[0].message.content.strip(), "latency_ms": latency_ms}
 
     responses = await asyncio.gather(*(_one(item) for item in items), return_exceptions=False)
     return responses
-
 
 def analyze_emails(texts: Sequence[str], metas: Sequence[Dict[str, Any]] | None = None) -> Sequence[Dict[str, Any]]:
     metas = metas or [{} for _ in texts]
@@ -138,21 +197,24 @@ def analyze_emails(texts: Sequence[str], metas: Sequence[Dict[str, Any]] | None 
             }
         )
 
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
+    llm_enabled = os.getenv("ENABLE_LLM_JUDGE", "0") == "1" and os.environ.get("OPENAI_API_KEY")
 
-    if loop is None:
-        feedback = asyncio.run(feedback_async(fused_records, detection_policy=detection_policy))
+    if llm_enabled:
+        for record in fused_records:
+            llm = final_judge_with_llm(
+                email_text=record["text"],
+                base_prob=record.get("base_phish_probability", 0.0),
+                rule_score=record.get("rule_score", 0.0),
+                rule_signals=record.get("rule_signals", []),
+            )
+            if llm:
+                record["label"] = llm["label"]
+                record["confidence"] = clamp_confidence(llm["confidence_pct"] / 100.0)
+                record["feedback"] = llm.get("brief_reason")
+                record["latency_ms"] = None
     else:
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, feedback_async(fused_records, detection_policy=detection_policy))
-            feedback = future.result()
-
-    for record, fb in zip(fused_records, feedback):
-        record["feedback"] = fb["content"]
-        record["latency_ms"] = fb["latency_ms"]
+        feedback = _run_coro_allow_nested(feedback_async(fused_records, detection_policy=detection_policy))
+        for record, fb in zip(fused_records, feedback):
+            record["feedback"] = fb["content"]
+            record["latency_ms"] = fb["latency_ms"]
     return fused_records
