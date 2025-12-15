@@ -63,8 +63,11 @@ class RuleSignal:
     reason: str
 
 
+URL_REGEX = re.compile(r"(?:(?:https?://)|(?:www\\.))[^\s)]+", flags=re.IGNORECASE)
+
+
 def _extract_urls(text: str) -> List[str]:
-    return re.findall(r"https?://[^\s)]+", text or "", flags=re.IGNORECASE)
+    return URL_REGEX.findall(text or "")
 
 
 def _is_ip(host: str) -> bool:
@@ -79,7 +82,10 @@ def _is_ip(host: str) -> bool:
 def _score_urls(urls: Iterable[str]) -> List[RuleSignal]:
     signals: List[RuleSignal] = []
     for url in urls:
-        parsed = urlparse(url)
+        normalized_url = url
+        if url.lower().startswith("www."):
+            normalized_url = "https://" + url
+        parsed = urlparse(normalized_url)
         host = (parsed.hostname or "").lower()
         scheme = (parsed.scheme or "").lower()
 

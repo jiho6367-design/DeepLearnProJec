@@ -6,7 +6,7 @@ import os
 from typing import Any, Dict, List, Tuple
 
 from optimized_pipeline import classify_batch, PHISH_THRESHOLD, MODEL_WEIGHT
-from scoring import compute_rule_score, fuse_scores, decide_label, clamp_confidence
+from scoring import compute_rule_score, fuse_scores, clamp_confidence
 
 
 def _load_rows(path: str) -> List[Dict[str, Any]]:
@@ -28,11 +28,32 @@ def _combine_text(row: Dict[str, Any]) -> str:
     return "\n".join(part for part in (subject, body) if part)
 
 
-def _predict(texts: List[str]) -> List[Dict[str, Any]]:
+def _extract_meta(row: Dict[str, Any]) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {}
+    auth = {}
+    for key in ("spf_pass", "dkim_pass", "dmarc_pass"):
+        if key in row and row[key] != "":
+            auth[key] = str(row[key]).strip().lower() in {"1", "true", "yes", "pass"}
+    if auth:
+        meta["auth_results"] = auth
+    if "attachments" in row and row["attachments"]:
+        att_list = []
+        for token in str(row["attachments"]).split(","):
+            token = token.strip()
+            if not token:
+                continue
+            att_list.append({"filename": token})
+        meta["attachments"] = att_list
+    return meta
+
+
+def _predict(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    texts = [_combine_text(row) for row in rows]
+    metas = [_extract_meta(row) for row in rows]
     base = classify_batch(texts)
     fused: List[Dict[str, Any]] = []
-    for item in base:
-        rule_score, _ = compute_rule_score(item["text"], {})
+    for item, meta in zip(base, metas):
+        rule_score, _ = compute_rule_score(item["text"], meta)
         fused_score = fuse_scores(item["phish_probability"], rule_score, model_weight=MODEL_WEIGHT)
         fused.append(
             {
@@ -84,10 +105,9 @@ def main():
     if not rows:
         raise SystemExit("No rows found in CSV.")
 
-    texts = [_combine_text(row) for row in rows]
     labels = [_to_bool(row.get("label", "")) for row in rows]
 
-    predictions = _predict(texts)
+    predictions = _predict(rows)
     scores = [p["phish_probability"] for p in predictions]
 
     metrics = _metrics(labels, scores, args.threshold)

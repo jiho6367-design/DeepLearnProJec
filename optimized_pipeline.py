@@ -72,6 +72,9 @@ def classify_batch(texts: Sequence[str]) -> Sequence[Dict[str, Any]]:
 async def feedback_async(
     items: Sequence[Dict[str, Any]], detection_policy: str = ""
 ) -> Sequence[Dict[str, Any]]:
+    if not os.environ.get("OPENAI_API_KEY"):
+        return [{"content": None, "latency_ms": None} for _ in items]
+
     async def _one(item: Dict[str, Any]):
         prompt = f"""Detection policy:
 {detection_policy or 'Use best-practice phishing detection criteria (payload, sender, urgency, links).'}
