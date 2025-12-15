@@ -26,7 +26,7 @@ st.title("PhishGuard Operations Dashboard")
 
 # --- token handling -------------------------------------------------------
 env_token = os.getenv("PHISH_API_TOKEN", "").strip()
-ui_token = st.text_input("API Token (optional, UI overrides env)", value="")
+ui_token = st.text_input("API Token (optional, UI overrides env)", value="", type="password")
 API_TOKEN = ui_token.strip() or env_token  # UI input has priority over env
 headers = {"X-API-Key": API_TOKEN} if API_TOKEN else {}
 if ui_token.strip():

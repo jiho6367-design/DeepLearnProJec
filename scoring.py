@@ -63,7 +63,7 @@ class RuleSignal:
     reason: str
 
 
-URL_REGEX = re.compile(r"(?:(?:https?://)|(?:www.))[^\s)]+", flags=re.IGNORECASE)
+URL_REGEX = re.compile(r"(?:(?:https?://)|(?:www\.))[^\s)]+", flags=re.IGNORECASE)
 
 
 def _extract_urls(text: str) -> List[str]:
@@ -82,12 +82,25 @@ def _is_ip(host: str) -> bool:
 def _score_urls(urls: Iterable[str]) -> List[RuleSignal]:
     signals: List[RuleSignal] = []
     for url in urls:
-        normalized_url = url
-        if url.lower().startswith("www."):
-            normalized_url = "https://" + url
-        parsed = urlparse(normalized_url)
+        normalized_url = url.strip()
+
+        # 흔한 끝문자 정리 (메일/HTML에서 링크 뒤에 붙는 괄호/마침표 등)
+        normalized_url = normalized_url.strip(" <>\"'.,;:!?)].")
+
+        if normalized_url.lower().startswith("www."):
+            normalized_url = "https://" + normalized_url
+
+        try:
+            parsed = urlparse(normalized_url)
+        except ValueError:
+            # Invalid IPv6 URL 등 깨진 URL은 무시 (서버 500 방지)
+            continue
+
         host = (parsed.hostname or "").lower()
         scheme = (parsed.scheme or "").lower()
+
+        if not host:
+            continue
 
         if scheme not in {"http", "https"}:
             signals.append(RuleSignal("bad_scheme", 0.35, f"Non-HTTP scheme: {scheme}"))
@@ -104,6 +117,7 @@ def _score_urls(urls: Iterable[str]) -> List[RuleSignal]:
         if host in SHORTENER_HOSTS:
             signals.append(RuleSignal("url_shortener", 0.25, f"URL shortener: {host}"))
     return signals
+
 
 
 def _score_auth(meta: Dict[str, Any]) -> List[RuleSignal]:
