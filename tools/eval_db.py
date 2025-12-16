@@ -47,29 +47,45 @@ def detect_gt_column(columns: List[str]) -> Optional[str]:
     return None
 
 
-def load_predictions(conn: sqlite3.Connection, table: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    cols = [c for c, _ in table_columns(conn, table)]
-    colset = {c.lower(): c for c in cols}
-    gt_col = detect_gt_column(cols)
+def load_predictions_with_gt(conn: sqlite3.Connection, pred_table: str, only_labeled: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str], int, int]:
+    pred_cols = [c for c, _ in table_columns(conn, pred_table)]
+    colmap = {c.lower(): c for c in pred_cols}
 
-    fields = []
+    base_fields = []
     for want in ["label", "confidence", "feedback", "phish_probability", "base_prob", "rule_score", "fused", "timestamp", "date", "id", "gmail_id"]:
-        if want in colset:
-            fields.append(colset[want])
-    if gt_col:
-        fields.append(gt_col)
-    if not fields:
-        raise RuntimeError(f"No usable columns found in {table}")
+        if want in colmap:
+            base_fields.append(colmap[want])
+    if not base_fields:
+        raise RuntimeError(f"No usable columns found in {pred_table}")
 
-    sql = f"SELECT {', '.join(fields)} FROM {table}"
-    rows = conn.execute(sql).fetchall()
+    # Join to human_labels if present
+    tables = list_tables(conn)
+    has_human = "human_labels" in tables
+    gt_col = None
+    labeled_total = 0
+
+    if has_human:
+        gt_col = "gt_label"
+        sel_fields = [f"ea.{f}" for f in base_fields] + ["hl.gt_label AS gt_label"]
+        sql = f"SELECT {', '.join(sel_fields)} FROM {pred_table} ea LEFT JOIN human_labels hl ON ea.id = hl.id"
+        if only_labeled:
+            sql += " WHERE hl.gt_label IS NOT NULL"
+        rows = conn.execute(sql).fetchall()
+        labeled_total = conn.execute("SELECT COUNT(*) FROM human_labels WHERE gt_label IS NOT NULL").fetchone()[0]
+    else:
+        sel_fields = base_fields
+        sql = f"SELECT {', '.join(sel_fields)} FROM {pred_table}"
+        rows = conn.execute(sql).fetchall()
+
     records: List[Dict[str, Any]] = []
     for row in rows:
-        rec = {}
-        for key, value in zip(fields, row):
+        rec: Dict[str, Any] = {}
+        for key, value in zip([f.split(".")[-1] for f in sel_fields], row):
             rec[key] = value
         records.append(rec)
-    return records, gt_col
+
+    total_rows = conn.execute(f"SELECT COUNT(*) FROM {pred_table}").fetchone()[0]
+    return records, gt_col, labeled_total, total_rows
 
 
 def to_bool_label(value: Any) -> Optional[int]:
@@ -124,6 +140,7 @@ def main():
     parser.add_argument("--sweep", action="store_true", help="Run threshold/model_weight sweeps")
     parser.add_argument("--thresholds", nargs="*", type=float, default=None, help="Custom thresholds for sweep")
     parser.add_argument("--weights", nargs="*", type=float, default=[0.6, 0.65, 0.7, 0.75, 0.8], help="Model weights for sweep when base_prob+rule_score available")
+    parser.add_argument("--only_labeled", action="store_true", help="Evaluate only rows with human_labels.gt_label present")
     args = parser.parse_args()
 
     db_path = Path(args.db)
@@ -142,24 +159,33 @@ def main():
         raise SystemExit("Could not find a table with label/confidence.")
     print(f"\nUsing predictions from table: {pred_table}")
 
-    records, gt_col = load_predictions(conn, pred_table)
-    print(f"Loaded {len(records)} rows")
-
+    records, gt_col, labeled_total, total_rows = load_predictions_with_gt(conn, pred_table, only_labeled=args.only_labeled)
+    print(f"Loaded {len(records)} rows (total in table {pred_table}: {total_rows})")
     if gt_col:
-        print(f"Detected ground-truth column: {gt_col}")
+        print(f"Human labels detected via human_labels.gt_label. Labeled rows: {labeled_total}. Evaluating on: {len(records)} rows.")
     else:
-        print("No ground-truth column detected (gt_label/user_label/etc). Accuracy metrics will be skipped.")
+        print("No ground-truth column detected (human_labels missing). Accuracy metrics will be skipped.")
+
+    if len(records) == 0:
+        print("\nNo labeled rows to evaluate.")
+        print("Fill gt_label in label_candidates.csv with 'phishing' or 'normal', then re-import.")
+        return
 
     # Prepare scores and labels
     gt_labels: List[int] = []
     scores: List[float] = []
-    for rec in records:
-        scores.append(pick_score(rec, weight=args.weights[0] if args.weights else 0.7))
-        gt_val = to_bool_label(rec.get(gt_col)) if gt_col else None
-        if gt_col:
-            gt_labels.append(gt_val if gt_val is not None else -1)
 
-    has_gt = gt_col is not None and all(v in (0, 1) for v in gt_labels)
+    for rec in records:
+        if not gt_col:
+            continue
+        gt_val = to_bool_label(rec.get(gt_col))
+        if gt_val is None:
+            continue
+    score = pick_score(rec, weight=args.weights[0] if args.weights else 0.7)
+    gt_labels.append(gt_val)
+    scores.append(score)
+
+    has_gt = len(gt_labels) > 0 and len(gt_labels) == len(scores)
 
     # Single-threshold report
     if has_gt:

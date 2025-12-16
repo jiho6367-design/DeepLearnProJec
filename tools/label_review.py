@@ -13,7 +13,7 @@ def ensure_table(conn: sqlite3.Connection, table: str = "human_labels") -> None:
         f"""
         CREATE TABLE IF NOT EXISTS {table} (
             id TEXT PRIMARY KEY,
-            gt_label TEXT,
+            gt_label TEXT NOT NULL CHECK(gt_label IN ('phishing','normal')),
             noted_at TEXT
         )
         """
@@ -21,29 +21,45 @@ def ensure_table(conn: sqlite3.Connection, table: str = "human_labels") -> None:
     conn.commit()
 
 
-def export_candidates(conn: sqlite3.Connection, out_csv: Path, limit: int = 50, src_table: str = "email_analysis") -> List[str]:
+def export_candidates(
+    conn: sqlite3.Connection, out_csv: Path, limit: int = 50, src_table: str = "email_analysis"
+) -> List[str]:
     cols = [row[1] for row in conn.execute(f"PRAGMA table_info({src_table})")]
     if "id" not in cols:
         raise SystemExit(f"{src_table} must have an id column to export for labeling.")
 
-    rows = conn.execute(f"SELECT id, subject, label, confidence, feedback FROM {src_table} LIMIT ?", (limit,)).fetchall()
+    rows = conn.execute(
+        f"SELECT id, subject, body, label, confidence, feedback FROM {src_table} LIMIT ?", (limit,)
+    ).fetchall()
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["id", "subject", "label", "confidence", "feedback", "gt_label (fill: phishing|normal)"])
-        writer.writerows(rows)
+        writer.writerow(["id", "subject", "body", "label", "confidence", "feedback", "gt_label"])
+        for r in rows:
+            rid, subj, body, lab, conf, fb = r
+            body = (body or "")[:500]
+            writer.writerow([rid, subj, body, lab, conf, fb, ""])
     return [r[0] for r in rows]
 
 
 def import_labels(conn: sqlite3.Connection, in_csv: Path, table: str = "human_labels") -> int:
     ensure_table(conn, table)
     inserted = 0
+    total_rows = 0
+    valid_labels = 0
     with in_csv.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            gt = (row.get("gt_label") or row.get("gt_label (fill: phishing|normal)") or "").strip().lower()
+            total_rows += 1
+            norm_row = {(k or "").strip(): (v or "") for k, v in row.items()}
+            gt = (
+                norm_row.get("gt_label")
+                or norm_row.get("gt_label (fill: phishing|normal)")
+                or ""
+            ).strip().lower()
             if gt not in {"phishing", "normal"}:
                 continue
-            id_ = (row.get("id") or "").strip()
+            valid_labels += 1
+            id_ = (norm_row.get("id") or "").strip()
             if not id_:
                 continue
             conn.execute(
@@ -52,6 +68,7 @@ def import_labels(conn: sqlite3.Connection, in_csv: Path, table: str = "human_la
             )
             inserted += 1
     conn.commit()
+    print(f"Processed rows: {total_rows}, valid gt_label: {valid_labels}, inserted/upserted: {inserted}")
     return inserted
 
 
@@ -68,7 +85,10 @@ def main():
 
     if args.export:
         exported_ids = export_candidates(conn, Path(args.out), limit=args.limit)
-        print(f"Exported {len(exported_ids)} rows to {args.out}. Fill gt_label column (phishing|normal) and re-import with --import_csv.")
+        print(
+            f"Exported {len(exported_ids)} rows to {args.out}. "
+            "Fill gt_label column (phishing|normal) and re-import with --import_csv."
+        )
 
     if args.import_csv:
         inserted = import_labels(conn, Path(args.import_csv))
