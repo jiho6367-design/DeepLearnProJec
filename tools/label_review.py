@@ -44,32 +44,41 @@ def export_candidates(
 def import_labels(conn: sqlite3.Connection, in_csv: Path, table: str = "human_labels") -> int:
     ensure_table(conn, table)
     inserted = 0
-    total_rows = 0
-    valid_labels = 0
+
     with in_csv.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            total_rows += 1
-            norm_row = {(k or "").strip(): (v or "") for k, v in row.items()}
-            gt = (
-                norm_row.get("gt_label")
-                or norm_row.get("gt_label (fill: phishing|normal)")
-                or ""
-            ).strip().lower()
+
+        # (A) 헤더 정규화
+        raw_headers = reader.fieldnames or []
+        headers = [h.strip() for h in raw_headers if h is not None]
+
+        print(f"[import_labels] detected headers={headers}")
+
+        for i, row in enumerate(reader):
+            # (B) row 키 정규화
+            norm_row = { (k.strip() if k else k): v for k, v in (row or {}).items() if k }
+
+            if i < 3:
+                print(f"[import_labels] sample row {i} keys={list(norm_row.keys())}")
+
+            # (C) gt_label은 오직 이 컬럼만 읽기
+            gt = (norm_row.get("gt_label") or "").strip().lower()
             if gt not in {"phishing", "normal"}:
                 continue
-            valid_labels += 1
+
             id_ = (norm_row.get("id") or "").strip()
             if not id_:
                 continue
+
             conn.execute(
                 f"INSERT OR REPLACE INTO {table} (id, gt_label, noted_at) VALUES (?, ?, ?)",
                 (id_, gt, dt.datetime.utcnow().isoformat()),
             )
             inserted += 1
+
     conn.commit()
-    print(f"Processed rows: {total_rows}, valid gt_label: {valid_labels}, inserted/upserted: {inserted}")
     return inserted
+
 
 
 def main():
