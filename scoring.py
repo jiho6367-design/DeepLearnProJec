@@ -55,6 +55,34 @@ URGENT_KEYWORDS = {
     "payment",
 }
 
+TRUSTED_DOMAINS = {
+    "google.com",
+    "microsoft.com",
+    "office.com",
+    "outlook.com",
+    "live.com",
+    "sharepoint.com",
+    "github.com",
+    "dropbox.com",
+    "box.com",
+    "adobe.com",
+}
+
+ACTION_LINK_KEYWORDS = {
+    "login",
+    "log in",
+    "verify",
+    "verification",
+    "confirm",
+    "access",
+    "view",
+    "review",
+    "claim",
+    "wallet",
+    "secure session",
+    "document",
+}
+
 
 @dataclass
 class RuleSignal:
@@ -118,6 +146,36 @@ def _score_urls(urls: Iterable[str]) -> List[RuleSignal]:
             signals.append(RuleSignal("url_shortener", 0.25, f"URL shortener: {host}"))
     return signals
 
+
+def _is_trusted_host(host: str) -> bool:
+    return any(host == dom or host.endswith("." + dom) for dom in TRUSTED_DOMAINS)
+
+
+def _score_untrusted_link_with_action(text: str, urls: Iterable[str]) -> List[RuleSignal]:
+    lowered = (text or "").lower()
+    action_hit = next((kw for kw in ACTION_LINK_KEYWORDS if kw in lowered), None)
+    if not action_hit:
+        return []
+    signals: List[RuleSignal] = []
+    for url in urls:
+        normalized_url = url.strip().strip(" <>\"'.,;:!?)].")
+        if normalized_url.lower().startswith("www."):
+            normalized_url = "https://" + normalized_url
+        try:
+            host = (urlparse(normalized_url).hostname or "").lower()
+        except Exception:
+            continue
+        if not host or _is_trusted_host(host):
+            continue
+        signals.append(
+            RuleSignal(
+                "untrusted_link_action",
+                0.35,
+                f"Untrusted link host {host} with action keyword '{action_hit}'",
+            )
+        )
+        break
+    return signals
 
 
 def _score_auth(meta: Dict[str, Any]) -> List[RuleSignal]:
@@ -203,6 +261,7 @@ def compute_rule_score(text: str, meta: Dict[str, Any] | None = None) -> Tuple[f
 
     urls = _extract_urls(text)
     signals.extend(_score_urls(urls))
+    signals.extend(_score_untrusted_link_with_action(text, urls))
     signals.extend(_score_auth(meta))
     signals.extend(_score_attachments(meta))
     signals.extend(_score_keywords(text))
