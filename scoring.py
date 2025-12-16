@@ -92,8 +92,8 @@ def _score_urls(urls: Iterable[str]) -> List[RuleSignal]:
 
         try:
             parsed = urlparse(normalized_url)
-        except ValueError:
-            # Invalid IPv6 URL 등 깨진 URL은 무시 (서버 500 방지)
+        except Exception:
+            # Malformed URL should not break scoring; skip it.
             continue
 
         host = (parsed.hostname or "").lower()
@@ -151,6 +151,52 @@ def _score_keywords(text: str) -> List[RuleSignal]:
     return [RuleSignal("urgent_language", weight, f"Urgent keywords: {', '.join(hits)}")]
 
 
+RECEIPT_KEYWORDS = [
+    "결제",
+    "영수증",
+    "구독",
+    "청구",
+    "승인",
+    "금액",
+    "krw",
+    "원",
+    "카드",
+    "결제일",
+    "주문번호",
+    "invoice",
+    "receipt",
+    "payment",
+    "subscription",
+]
+
+ACTION_KEYWORDS = [
+    "로그인",
+    "login",
+    "verify",
+    "인증",
+    "click",
+    "링크",
+    "비밀번호",
+    "password",
+    "계정",
+    "정지",
+    "환불",
+    "update payment",
+    "confirm",
+]
+
+
+def _looks_like_receipt(text: str) -> bool:
+    lowered = (text or "").lower()
+    hits = sum(1 for kw in RECEIPT_KEYWORDS if kw in lowered)
+    return hits >= 2
+
+
+def _has_action_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(kw in lowered for kw in ACTION_KEYWORDS)
+
+
 def compute_rule_score(text: str, meta: Dict[str, Any] | None = None) -> Tuple[float, List[RuleSignal]]:
     meta = meta or {}
     signals: List[RuleSignal] = []
@@ -168,6 +214,20 @@ def compute_rule_score(text: str, meta: Dict[str, Any] | None = None) -> Tuple[f
 
     total_weight = sum(sig.score for sig in signals)
     rule_score = max(0.0, min(1.0, total_weight))
+
+    try:
+        whitelist_allowed = (
+            _looks_like_receipt(text)
+            and urls == []
+            and not _has_action_request(text)
+            and not any(sig.name == "auth_fail" for sig in signals)
+            and not any(sig.name == "dangerous_attachment" for sig in signals)
+        )
+        if whitelist_allowed:
+            rule_score = max(0.0, rule_score - 0.25)
+    except Exception:
+        pass
+
     return rule_score, signals
 
 

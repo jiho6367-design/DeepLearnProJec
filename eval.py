@@ -48,18 +48,19 @@ def _extract_meta(row: Dict[str, Any]) -> Dict[str, Any]:
     return meta
 
 
-def _predict(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _predict_components(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     texts = [_combine_text(row) for row in rows]
     metas = [_extract_meta(row) for row in rows]
     base = classify_batch(texts)
     fused: List[Dict[str, Any]] = []
     for item, meta in zip(base, metas):
-        rule_score, _ = compute_rule_score(item["text"], meta)
-        fused_score = fuse_scores(item["phish_probability"], rule_score, model_weight=MODEL_WEIGHT)
+        rule_score, signals = compute_rule_score(item["text"], meta)
         fused.append(
             {
                 "text": item["text"],
-                "phish_probability": clamp_confidence(fused_score),
+                "base_prob": clamp_confidence(item["phish_probability"]),
+                "rule_score": clamp_confidence(rule_score),
+                "rule_signals": [sig.reason for sig in signals],
             }
         )
     return fused
@@ -100,6 +101,7 @@ def main():
     parser.add_argument("csv_path", help="CSV file with columns: text or subject/body, label")
     parser.add_argument("--threshold", type=float, default=PHISH_THRESHOLD, help="Decision threshold for phishing.")
     parser.add_argument("--sweep", action="store_true", help="Print threshold sweep from 0.1 to 0.9.")
+    parser.add_argument("--out", type=str, default=None, help="Write per-row results to CSV.")
     args = parser.parse_args()
 
     rows = _load_rows(args.csv_path)
@@ -108,8 +110,8 @@ def main():
 
     labels = [_to_bool(row.get("label", "")) for row in rows]
 
-    predictions = _predict(rows)
-    scores = [p["phish_probability"] for p in predictions]
+    components = _predict_components(rows)
+    scores = [fuse_scores(row["base_prob"], row["rule_score"], model_weight=MODEL_WEIGHT) for row in components]
 
     metrics = _metrics(labels, scores, args.threshold)
     print(f"Records: {len(rows)}")
@@ -119,11 +121,34 @@ def main():
         f"TP={metrics['tp']} FP={metrics['fp']} FN={metrics['fn']} TN={metrics['tn']}"
     )
 
+    if args.out:
+        out_fields = ["base_prob", "rule_score", "fused", "label", "gt_label", "rule_signals"]
+        with open(args.out, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=out_fields)
+            writer.writeheader()
+            for comp, score, gt in zip(components, scores, labels):
+                pred_label = "phishing" if score >= args.threshold else "normal"
+                writer.writerow(
+                    {
+                        "base_prob": f"{comp['base_prob']:.4f}",
+                        "rule_score": f"{comp['rule_score']:.4f}",
+                        "fused": f"{score:.4f}",
+                        "label": pred_label,
+                        "gt_label": "phishing" if gt else "normal",
+                        "rule_signals": "; ".join(comp.get("rule_signals", []))[:200],
+                    }
+                )
+
     if args.sweep:
         thresholds = [round(x, 2) for x in [0.1 + i * 0.05 for i in range(17)]]
-        print("\nThreshold sweep (precision / recall / f1):")
-        for t, m in threshold_sweep(labels, scores, thresholds):
-            print(f"{t:.2f}: P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}")
+        model_weights = [0.60, 0.65, 0.70, 0.75, 0.80]
+        print("\nWeight/Threshold sweep (precision / recall / f1):")
+        for mw in model_weights:
+            row_components = components
+            sweep_scores = [fuse_scores(c["base_prob"], c["rule_score"], model_weight=mw) for c in row_components]
+            for t in thresholds:
+                m = _metrics(labels, sweep_scores, t)
+                print(f"mw={mw:.2f} t={t:.2f}: P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}")
 
 
 if __name__ == "__main__":

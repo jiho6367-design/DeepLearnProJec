@@ -48,7 +48,7 @@ def classify_batch(texts: Sequence[str]) -> Sequence[Dict[str, Any]]:
     id2label = _infer_label_mapping()
     phish_idx = next((i for i, lbl in id2label.items() if "NEG" in lbl or "PHISH" in lbl), None)
 
-    outputs = []
+    outputs: List[Dict[str, Any]] = []
     for i, prob in enumerate(probs):
         idx = int(prob.argmax())
         raw = id2label.get(idx, "")
@@ -86,7 +86,9 @@ def _run_coro_allow_nested(coro):
         return future.result()
 
 
-def final_judge_with_llm(email_text: str, base_prob: float, rule_score: float, rule_signals: List[str]) -> Dict[str, Any] | None:
+def final_judge_with_llm(
+    email_text: str, base_prob: float, rule_score: float, rule_signals: List[str]
+) -> Dict[str, Any] | None:
     if not os.environ.get("OPENAI_API_KEY"):
         return None
 
@@ -107,6 +109,7 @@ Respond ONLY with JSON in this schema:
 {{"label": "phishing|normal", "confidence": 0-100, "brief_reason": "..."}}"""
 
     async def _call():
+        started = time.perf_counter()
         resp = await async_client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             temperature=0.0,
@@ -116,11 +119,12 @@ Respond ONLY with JSON in this schema:
                 {"role": "user", "content": prompt},
             ],
         )
+        latency_ms = (time.perf_counter() - started) * 1000
         content = resp.choices[0].message.content or "{}"
-        return json.loads(content)
+        return json.loads(content), latency_ms
 
     try:
-        result = _run_coro_allow_nested(_call())
+        result, latency_ms = _run_coro_allow_nested(_call())
     except Exception:
         return None
 
@@ -131,7 +135,7 @@ Respond ONLY with JSON in this schema:
         conf_raw = float(result.get("confidence", 0.0))
         conf_pct = max(0.0, min(100.0, conf_raw))
         reason = str(result.get("brief_reason", "")).strip()
-        return {"label": label, "confidence_pct": conf_pct, "brief_reason": reason}
+        return {"label": label, "confidence_pct": conf_pct, "brief_reason": reason, "latency_ms": latency_ms}
     except Exception:
         return None
 
@@ -168,6 +172,7 @@ Explain briefly why/why not it is risky, cite the policy items you used, and giv
     responses = await asyncio.gather(*(_one(item) for item in items), return_exceptions=False)
     return responses
 
+
 def analyze_emails(texts: Sequence[str], metas: Sequence[Dict[str, Any]] | None = None) -> Sequence[Dict[str, Any]]:
     metas = metas or [{} for _ in texts]
     base_results = classify_batch(texts)
@@ -201,20 +206,31 @@ def analyze_emails(texts: Sequence[str], metas: Sequence[Dict[str, Any]] | None 
 
     if llm_enabled:
         for record in fused_records:
-            llm = final_judge_with_llm(
-                email_text=record["text"],
-                base_prob=record.get("base_phish_probability", 0.0),
-                rule_score=record.get("rule_score", 0.0),
-                rule_signals=record.get("rule_signals", []),
-            )
-            if llm:
-                record["label"] = llm["label"]
-                record["confidence"] = clamp_confidence(llm["confidence_pct"] / 100.0)
-                record["feedback"] = llm.get("brief_reason")
-                record["latency_ms"] = None
+            try:
+                llm = final_judge_with_llm(
+                    email_text=record["text"],
+                    base_prob=record.get("base_phish_probability", 0.0),
+                    rule_score=record.get("rule_score", 0.0),
+                    rule_signals=record.get("rule_signals", []),
+                )
+                if llm:
+                    record["label"] = llm["label"]
+                    record["confidence"] = clamp_confidence(llm["confidence_pct"] / 100.0)
+                    record["feedback"] = llm.get("brief_reason")
+                    record["latency_ms"] = llm.get("latency_ms")
+            except Exception:
+                # Fall back to fused result without crashing
+                continue
     else:
-        feedback = _run_coro_allow_nested(feedback_async(fused_records, detection_policy=detection_policy))
-        for record, fb in zip(fused_records, feedback):
-            record["feedback"] = fb["content"]
-            record["latency_ms"] = fb["latency_ms"]
+        try:
+            feedback = _run_coro_allow_nested(feedback_async(fused_records, detection_policy=detection_policy))
+            for record, fb in zip(fused_records, feedback):
+                record["feedback"] = fb["content"]
+                record["latency_ms"] = fb["latency_ms"]
+        except Exception:
+            # If feedback generation fails, keep fused results
+            for record in fused_records:
+                record.setdefault("feedback", None)
+                record.setdefault("latency_ms", None)
+
     return fused_records
