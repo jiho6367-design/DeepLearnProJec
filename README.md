@@ -2,6 +2,13 @@
 
 딥러닝 기반 악성코드(피싱) 메일 탐지 및 대응 시스템을 구현하는 프로젝트입니다. Streamlit/Flask 대시보드, 모델 서빙, 메일 가져오기/분석 파이프라인을 통합해 운영 자동화를 목표로 합니다.
 
+## 최종 결과물 소개
+- **제품 형태**: PhishGuard – Gmail 연동형 피싱 메일 탐지·대응 운영 툴킷으로 Flask API, Streamlit 대시보드, 배치 수집 스크립트를 묶은 일체형 스택입니다.
+- **핵심 기능**: `ingestion_workflow.py`가 읽지 않은 메일을 자동 수집하고, SPF/DKIM/DMARC·링크 평판 룰 점수와 HF 분류기, LLM 정책 프롬프트를 앙상블한 `optimized_pipeline.py`로 위험도를 산출합니다.
+- **API 제공**: `api_service.py`가 `/api/analyze`, `/api/analyze_selected`, `/api/list_emails`, `/api/history`, `/metrics/summary` 등 REST 엔드포인트로 단건/배치 분석, Gmail 목록 조회, 분석 이력·KPI 조회를 제공합니다.
+- **대시보드**: `dashboard.py`에서 API 토큰 기반으로 업로드/선택 메일 분석, Gmail 목록 필터링·재분석, KPI 카드와 추세 차트, 분석 아카이브 검색·리뷰를 UI로 처리합니다.
+- **운영 데이터**: 분석 결과와 피드백을 SQLite(`data/phishguard.db`, `data/feedback.db`)에 캐시·저장하고, `eval.py`와 `tools/eval_db.py`로 임계값 스윕 및 회귀 테스트를 수행하는 구조로 납품되었습니다.
+
 ## 교수님 피드백 반영 방향
 - **메일함 신규 메일 수집 자동화**: Gmail 등 주요 웹메일 API를 통해 주기적으로 신규 메일을 가져오는 기능을 구현합니다.
 - **대형 메일 서비스의 악성 메일 탐지 기준 활용**: Gmail 등에서 제시하는 스팸·피싱 판정 규칙과 신뢰 지표를 학습 데이터 전처리/특징으로 반영합니다.
