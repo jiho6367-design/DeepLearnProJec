@@ -34,6 +34,7 @@
 - 오프라인 평가: `python eval.py samples.csv --sweep` 로 precision/recall/F1과 임계값 스윕을 출력합니다. 네트워크 없이 HuggingFace 캐시 + 룰 기반 점수만 사용합니다(피드백 LLM 호출 없음).
 - 임계값 결정: `PHISH_THRESHOLD`(기본 0.30)을 조정합니다. 보수적 운영(오탐 최소) 시 0.5~0.6, 공격 탐지 우선(미탐 최소) 시 0.25~0.35를 권장합니다. 결정 후 동일 샘플셋으로 재측정하여 변화폭을 기록합니다.
 - 회귀 테스트: 동일 CSV를 저장소에 보관하고 CI에서 `eval.py`를 돌려 precision/recall/F1이 감소하면 경고하도록 설정합니다.
+- DB 기반 평가: `python tools/eval_db.py --db data/phishguard.db --threshold 0.25 --sweep` 로 SQLite에 저장된 예측 결과를 바로 평가합니다. base_prob+rule_score가 있으면 weight 스윕을, gt_label이 없으면 정밀도/재현율 계산을 생략하고 안내합니다. 사람이 라벨링하려면 `python tools/label_review.py --db data/phishguard.db --export --out label_candidates.csv` 로 샘플을 추출해 라벨링 후 `--import_csv` 로 반영하세요.
 
 ## .env 배치 경로와 사용법
 - **위치**: 리포지토리 루트(`/workspace/DeepLearnProJec/.env`)에 `.env` 파일을 두면 됩니다. (이미 `.gitignore`에 추가되어 있으므로 커밋되지 않습니다.)

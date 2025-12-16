@@ -147,15 +147,39 @@ async def feedback_async(
         return [{"content": None, "latency_ms": None} for _ in items]
 
     async def _one(item: Dict[str, Any]):
-        prompt = f"""Detection policy:
+        prompt = f"""
+[DETECTION POLICY]
 {detection_policy or 'Use best-practice phishing detection criteria (payload, sender, urgency, links).'}
 
-Email:
+[EMAIL]
 {item['text']}
 
-Verdict: {item['label']} ({item['confidence']:.2%})
+[MODEL VERDICT]
+label={item['label']}
+confidence={item['confidence']:.2%}
 
-Explain briefly why/why not it is risky, cite the policy items you used, and give three safe actions. Respond in Korean."""
+[STRICT OUTPUT RULES - MUST FOLLOW]
+- Output language: Korean.
+- Your job is to EXPLAIN the verdict, not to change it.
+- You MUST align wording with label.
+
+A) If label == "normal":
+  - You MUST NOT claim it is phishing/scam/malicious, or conclude "위험하다/피싱이다/사기다".
+  - Allowed phrasing only: "주의할 수 있는 요소", "확인이 필요할 수 있음", "현재 기준으로는 정상으로 분류", "추가 증거가 있으면 재평가".
+  - If you mention any caution, include ONE line: "주의를 언급한 이유: (…)" 형태로.
+
+B) If label == "phishing":
+  - You MAY conclude it is phishing/suspicious and explain why.
+  - Provide concrete safe actions.
+
+[REQUIRED OUTPUT FORMAT]
+1) 한줄 결론:
+2) 근거 3개:
+3) 권장 조치 3개:
+4) 오탐/미탐 가능성 한줄:
+
+Return ONLY the formatted Korean text. No JSON.
+""".strip()
         started = time.perf_counter()
         resp = await async_client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
