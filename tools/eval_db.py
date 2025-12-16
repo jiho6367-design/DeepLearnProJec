@@ -77,12 +77,23 @@ def load_predictions_with_gt(conn: sqlite3.Connection, pred_table: str, only_lab
         sql = f"SELECT {', '.join(sel_fields)} FROM {pred_table}"
         rows = conn.execute(sql).fetchall()
 
+    def _field_to_key(f: str) -> str:
+        s = f.split(".")[-1].strip()
+        s_low = s.lower()
+        if " as " in s_low:
+            # e.g., "gt_label AS gt_label" -> "gt_label"
+            s = s_low.split(" as ")[-1].strip()
+        return s
+
+    keys = [_field_to_key(f) for f in sel_fields]
+
     records: List[Dict[str, Any]] = []
     for row in rows:
         rec: Dict[str, Any] = {}
-        for key, value in zip([f.split(".")[-1] for f in sel_fields], row):
+        for key, value in zip(keys, row):
             rec[key] = value
         records.append(rec)
+
 
     total_rows = conn.execute(f"SELECT COUNT(*) FROM {pred_table}").fetchone()[0]
     return records, gt_col, labeled_total, total_rows
@@ -172,20 +183,27 @@ def main():
         return
 
     # Prepare scores and labels
+        # Prepare scores and labels (KEEP LENGTHS ALIGNED)
     gt_labels: List[int] = []
     scores: List[float] = []
 
     for rec in records:
-        if not gt_col:
-            continue
-        gt_val = to_bool_label(rec.get(gt_col))
+        gt_val = to_bool_label(rec.get(gt_col)) if gt_col else None
         if gt_val is None:
+            # unlabeled or invalid label -> skip this row from evaluation
             continue
-    score = pick_score(rec, weight=args.weights[0] if args.weights else 0.7)
-    gt_labels.append(gt_val)
-    scores.append(score)
+
+        score = pick_score(rec, weight=args.weights[0] if args.weights else 0.7)
+        scores.append(score)
+        gt_labels.append(gt_val)
 
     has_gt = len(gt_labels) > 0 and len(gt_labels) == len(scores)
+
+    if not has_gt:
+        print("\nNo usable labeled rows to evaluate.")
+        print("Check gt_label values are strictly 'phishing' or 'normal'.")
+        return
+
 
     # Single-threshold report
     if has_gt:

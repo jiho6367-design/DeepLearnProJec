@@ -8,7 +8,7 @@ services:
       - ./data:/app/data
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
-      PHISH_THRESHOLD: ${PHISH_THRESHOLD:-0.30}
+      PHISH_THRESHOLD: ${PHISH_THRESHOLD:-0.20}
 
   dashboard:
     build: .
