@@ -218,7 +218,7 @@ def compute_rule_score(text: str, meta: Dict[str, Any] | None = None) -> Tuple[f
     try:
         whitelist_allowed = (
             _looks_like_receipt(text)
-            and urls == []
+            and not urls
             and not _has_action_request(text)
             and not any(sig.name == "auth_fail" for sig in signals)
             and not any(sig.name == "dangerous_attachment" for sig in signals)
