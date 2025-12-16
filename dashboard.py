@@ -288,7 +288,6 @@ with tab_analyze:
 
     # Browse & Select Emails
     st.subheader("Browse & Select Emails")
-    select_max = st.number_input("Max emails to load", min_value=1, max_value=50, value=20, step=1)
     LABEL_CHOICES = [
         "ALL",
         "INBOX",
@@ -301,6 +300,8 @@ with tab_analyze:
 
     if "email_list" not in st.session_state:
         st.session_state["email_list"] = []
+    if "email_list_raw" not in st.session_state:
+        st.session_state["email_list_raw"] = []
     if "selected_message_ids" not in st.session_state:
         st.session_state["selected_message_ids"] = []
 
@@ -309,9 +310,23 @@ with tab_analyze:
         value=True,
         help="Uses the analysis history to hide Gmail messages that are already stored in the archive.",
     )
+    apply_start_filter_list = st.checkbox("Apply start date filter", value=False, key="list_apply_start")
+    start_date_list = st.date_input(
+        "Start date (optional)",
+        value=pd.to_datetime("today").date(),
+        disabled=not apply_start_filter_list,
+        key="list_start_date",
+    )
+    apply_end_filter_list = st.checkbox("Apply end date filter", value=False, key="list_apply_end")
+    end_date_list = st.date_input(
+        "End date (optional)",
+        value=pd.to_datetime("today").date(),
+        disabled=not apply_end_filter_list,
+        key="list_end_date",
+    )
 
     if st.button("Load Email List"):
-        params = {"max_results": int(select_max)}
+        params = {"max_results": 50}
         if label_filter != "ALL":
             params["label"] = label_filter
         resp = call_api_with_retry(
@@ -340,12 +355,40 @@ with tab_analyze:
                     history_list = load_history_from_api(API_TOKEN)
                     analyzed_ids = {row.get("gmail_id") for row in history_list if row.get("gmail_id")}
                     results = [msg for msg in results if msg.get("gmail_id") not in analyzed_ids]
+                st.session_state["email_list_raw"] = results
                 st.session_state["email_list"] = results
 
-    email_list = st.session_state.get("email_list", [])
+    email_list_raw = st.session_state.get("email_list_raw", [])
     selected_ids: list[str] = []
-    if email_list:
-        emails_df = pd.DataFrame(email_list)
+    if email_list_raw:
+        emails_df = pd.DataFrame(email_list_raw)
+        date_series = None
+        date_only_series = None
+        if "date" in emails_df:
+            raw_dates = emails_df.get("date")
+            date_series = pd.to_datetime(raw_dates, errors="coerce", utc=True)
+            if date_series.isna().all():
+                date_series = pd.to_datetime(raw_dates, errors="coerce", unit="ms", utc=True)
+            if date_series.dt.tz is not None:
+                date_series = date_series.dt.tz_convert(None)
+            date_only_series = pd.Series(date_series.dt.date, index=emails_df.index)
+        if apply_start_filter_list and date_only_series is not None:
+            start_dt = pd.to_datetime(start_date_list, errors="coerce")
+            if pd.notna(start_dt):
+                start_date_only = start_dt.date()
+                mask = date_only_series >= start_date_only
+                emails_df = emails_df[mask]
+                date_series = date_series[mask] if date_series is not None else None
+                date_only_series = date_only_series[mask]
+        if apply_end_filter_list and date_only_series is not None:
+            end_dt = pd.to_datetime(end_date_list, errors="coerce")
+            if pd.notna(end_dt):
+                end_date_only = end_dt.date()
+                mask = date_only_series <= end_date_only
+                emails_df = emails_df[mask]
+                date_series = date_series[mask] if date_series is not None else None
+                date_only_series = date_only_series[mask]
+
         if "selected" not in emails_df:
             emails_df.insert(0, "selected", False)
         edited_df = st.data_editor(
@@ -430,17 +473,27 @@ with tab_archive:
         archive_df = archive_df[archive_df.get("subject", "").str.contains(archive_subject_query, case=False, na=False)]
 
     # Additional date range filter (year-month-day)
-    date_series = pd.to_datetime(archive_df.get("date"), errors="coerce")
-    if apply_start_filter:
+    date_series = pd.to_datetime(archive_df.get("date"), errors="coerce", utc=True)
+    if date_series.isna().all():
+        date_series = pd.to_datetime(archive_df.get("date"), errors="coerce", unit="ms", utc=True)
+    if date_series.dt.tz is not None:
+        date_series = date_series.dt.tz_convert(None)
+    date_only_series = pd.Series(date_series.dt.date, index=archive_df.index) if not date_series.isna().all() else None
+
+    if apply_start_filter and date_only_series is not None:
         start_dt = pd.to_datetime(start_date_val, errors="coerce")
         if pd.notna(start_dt):
-            archive_df = archive_df[date_series >= start_dt]
-            date_series = date_series[date_series >= start_dt]
-    if apply_end_filter:
+            start_date_only = start_dt.date()
+            mask = date_only_series >= start_date_only
+            archive_df = archive_df[mask]
+            date_only_series = date_only_series[mask]
+    if apply_end_filter and date_only_series is not None:
         end_dt = pd.to_datetime(end_date_val, errors="coerce")
         if pd.notna(end_dt):
-            archive_df = archive_df[date_series <= end_dt]
-            date_series = date_series[date_series <= end_dt]
+            end_date_only = end_dt.date()
+            mask = date_only_series <= end_date_only
+            archive_df = archive_df[mask]
+            date_only_series = date_only_series[mask]
 
     if not archive_df.empty:
         df = archive_df.copy()
@@ -455,27 +508,37 @@ with tab_archive:
 
         st.dataframe(table_view, use_container_width=True, height=400)
 
-        options = list(df.index)
-        labels = [
-            f"{df.loc[i, 'date']} | {df.loc[i, 'subject'] or '(no subject)'}"
-            for i in options
-        ]
-        if "archive_selected_idx" not in st.session_state:
-            st.session_state["archive_selected_idx"] = options[0] if options else None
+        id_lookup = {}
+        label_lookup = {}
+        for row_idx, row in df.iterrows():
+            message_id = row.get("gmail_id") or row.get("id") or row_idx
+            id_lookup[message_id] = row_idx
+            label_lookup[message_id] = f"{row.get('date')} | {row.get('subject') or '(no subject)'}"
 
-        selected_idx = st.selectbox(
-            "Select an email to view body",
-            options=options,
-            format_func=lambda i: labels[options.index(i)] if options else "",
-            index=options.index(st.session_state["archive_selected_idx"]) if options and st.session_state["archive_selected_idx"] in options else 0,
-            key="archive_select",
-        ) if options else None
+        available_ids = list(id_lookup.keys())
+        current_id = st.session_state.get("archive_selected_id")
+        if available_ids and current_id not in id_lookup:
+            current_id = available_ids[0]
+            st.session_state["archive_selected_id"] = current_id
 
-        if selected_idx is not None:
-            st.session_state["archive_selected_idx"] = selected_idx
-            subject = df.loc[selected_idx, "subject"] or "(no subject)"
-            body_text = df.loc[selected_idx, "display_body"]
-            st.markdown(f"### Email body — {subject}")
+        selected_id = (
+            st.selectbox(
+                "Select an email to view body",
+                options=available_ids,
+                format_func=lambda msg_id: label_lookup.get(msg_id, str(msg_id)),
+                index=available_ids.index(current_id) if current_id in id_lookup else 0,
+                key="archive_select",
+            )
+            if available_ids
+            else None
+        )
+
+        if selected_id is not None:
+            st.session_state["archive_selected_id"] = selected_id
+            row_idx = id_lookup[selected_id]
+            subject = df.loc[row_idx, "subject"] or "(no subject)"
+            body_text = df.loc[row_idx, "display_body"]
+            st.markdown(f"### Email body: {subject}")
             st.text(body_text if body_text else "No body text available for this email.")
         else:
             st.caption("Click an email to see the body.")

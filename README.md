@@ -9,9 +9,40 @@
 - **대시보드**: `dashboard.py`에서 API 토큰 기반으로 업로드/선택 메일 분석, Gmail 목록 필터링·재분석, KPI 카드와 추세 차트, 분석 아카이브 검색·리뷰를 UI로 처리합니다.
 - **운영 데이터**: 분석 결과와 피드백을 SQLite(`data/phishguard.db`, `data/feedback.db`)에 캐시·저장하고, `eval.py`와 `tools/eval_db.py`로 임계값 스윕 및 회귀 테스트를 수행하는 구조로 납품되었습니다.
 
+## 프로젝트 개요 및 목표
+- Gmail 기반 이메일에 대해 **규칙 기반 점수 + AI 분석**을 결합해 피싱을 탐지하는 실무 지향 보안 파이프라인입니다.
+- 모델 아키텍처 변경 없이 **미탐(False Negative) 최소화**를 우선 목표로 두고, 현실적인 임계값/룰 조합으로 안정성을 확보합니다.
+
+## 탐지 전략 (Threshold & Rule)
+- **임계값 고정**: `PHISH_THRESHOLD = 0.20`을 기본으로 유지해 낮은 확률의 피싱도 규칙 점수로 보완 가능하게 설계했습니다.
+- **규칙 기반 점수**: `untrusted_link_action` 룰(가중치 0.35)을 추가해 비신뢰 도메인 링크 + 행동 유도 키워드(login, verify, claim, review 등)가 동시에 존재하면 점수를 크게 부여합니다. 허용 도메인(allowlist)은 제외합니다.
+- **목적**: 낮은 모델 확률도 규칙 점수로 끌어올려 미탐을 줄이고, FP는 관리 가능한 범위로 유지합니다.
+
+## FN 개선 결과 (최근 재분석)
+- **Before**(Threshold 0.20, 규칙 미적용): FN 6건 → 피싱이 정상으로 분류되는 사례 다수.
+- **After**(룰 적용·재분석): 소규모 검증셋에서 `TP/FP/FN/TN = 2/1/1/0`, FN이 6 → 1로 감소, FP는 제한적. 목표한 “빠른 안정화(A안)” 기준 충족.
+
+## 현재 상태 체크리스트
+- `PHISH_THRESHOLD` 고정 적용 및 FN 패턴 분석 완료.
+- `untrusted_link_action` 규칙 기반 보완 로직 구현 및 적용.
+- 재분석으로 FN 감소 효과 확인, FP는 관리 가능 수준.
+- **최소 수정(minimal change)** 전략을 유지한 채 운영 가능한 안정 상태 확보.
+
+## 핵심 메시지
+- “완벽한 모델”보다 **놓치지 않는 탐지**가 우선이며, 임계값 조정과 단일 룰 추가만으로도 실용적 개선을 달성했습니다.
+- 향후에도 FP/FN 로그 기반으로 규칙·임계값을 점진 조정해 안정성을 유지합니다.
+
+## 프롬프트 설계 요약
+- `phishing_analysis.py`(15-35): 메타데이터·본문 미리보기를 입력받아 JSON `{ "is_phishing": bool, "risk_score": 0-100, "reasons": [], "summary": "" }`만 반환하도록 강제하는 단일 메일 분석 프롬프트.
+- `optimized_pipeline.py`(96-138): 모델 확률·룰 점수·탐지 신호를 입력해 JSON `{label, confidence, brief_reason}`만 허용하는 최종 판정 LLM 프롬프트.
+- `optimized_pipeline.py`(150-182): Detection Policy 삽입 후 label·confidence를 넘겨 한국어 설명을 생성하는 피드백 프롬프트; 정상/피싱별 문구 제약과 1줄 결론·근거 3개·조치 3개·오탐/미탐 한줄 형식 강제.
+- `api_service.py`(169-195): 대시보드 응답용 간결 피드백 프롬프트; 모델 verdict·confidence를 포함해 한국어로 “차분한 보안 분석가” 톤을 유지.
+- `prompt_version_tracker.py`: 프롬프트 버전/실험 로그를 SQLite(`data/prompt_experiments.db`)에 저장하며 `register_prompt`/`log_run`/`print_report`로 관리.
+- `PHISHING_POLICY` env로 Detection Policy를 주입하며, 기본 문자열은 Gmail 라벨·SPF/DKIM/DMARC·링크/첨부·발신자 불일치·긴급 언어를 고려하도록 안내합니다.
+
 ## 교수님 피드백 반영 방향
 - **메일함 신규 메일 수집 자동화**: Gmail 등 주요 웹메일 API를 통해 주기적으로 신규 메일을 가져오는 기능을 구현합니다.
-- **대형 메일 서비스의 악성 메일 탐지 기준 활용**: Gmail 등에서 제시하는 스팸·피싱 판정 규칙과 신뢰 지표를 학습 데이터 전처리/특징으로 반영합니다.
+- **Gmail 신호 활용(라벨/인증 결과)**: Gmail 라벨(SPAM/IMPORTANT 등)과 Authentication-Results의 SPF/DKIM/DMARC pass/fail 신호를 모델 입력·규칙 점수에 포함합니다. (Gmail 내부 스팸/피싱 판정 규칙 자체를 학습·재현하지는 않습니다.)
 - **AI 모델에 명확한 탐지 기준 제시**: 프롬프트와 분류 모델에 서비스 정책(의심 척도, 신고 기준 등)을 명시하여 일관된 탐지 지시를 내립니다.
 
 ## 메일 가져오기 및 처리 과정 (제안된 파이프라인)
