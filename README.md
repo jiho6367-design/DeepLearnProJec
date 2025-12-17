@@ -84,7 +84,6 @@
   GOOGLE_REFRESH_TOKEN=your_google_refresh_token
   OPENAI_API_KEY=your_openai_key
   OPENAI_MODEL=gpt-4o-mini
-  PHISHING_POLICY="회사 정책에 맞춘 피싱 탐지 기준"
   GMAIL_USER=your_gmail_address
   ```
 - **적용 방법**: 쉘에서 `set -a; source .env; set +a`로 한번 로드하면 이후 터미널 세션에서 환경 변수가 잡힌 상태로 `python ingestion_workflow.py` 등 명령을 실행할 수 있습니다.
